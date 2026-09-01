@@ -33,7 +33,7 @@ bot = Client(
 async def handle_ping(request):
     return web.Response(text="Telegram Stream Engine is Online!")
 
-# Route 2: Video Stream Handler (Supports GET & HEAD with Range Headers)
+# Route 2: Video Stream Handler (Auto-handles GET and HEAD with Range Headers)
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -67,7 +67,7 @@ async def handle_stream(request):
             "Access-Control-Allow-Origin": "*",
         }
 
-        # Support HEAD requests for media player metadata checks
+        # Handle HEAD requests (media player metadata checks)
         if request.method == "HEAD":
             return web.Response(status=200, headers=headers)
 
@@ -146,7 +146,6 @@ async def init_app():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     app.router.add_get("/watch/{msg_id}", handle_stream)
-    app.router.add_route("HEAD", "/watch/{msg_id}", handle_stream)
     return app
 
 if __name__ == "__main__":
