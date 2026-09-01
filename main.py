@@ -16,13 +16,10 @@ PORT = int(os.getenv("PORT", "8080"))
 BIND_ADDRESS = os.getenv("BIND_ADDRESS", "0.0.0.0")
 FQDN = os.getenv("FQDN", f"http://localhost:{PORT}").rstrip("/")
 
-# Basic credentials validation
 if not API_ID or not API_HASH or not BOT_TOKEN or not BIN_CHANNEL:
-    print("\n[CRITICAL ERROR] Missing mandatory environment variables!")
-    print("Please configure API_ID, API_HASH, BOT_TOKEN, and BIN_CHANNEL in your cloud dashboard.\n")
+    print("\n[CRITICAL ERROR] Missing mandatory environment variables!\n")
     sys.exit(1)
 
-# In-memory session prevents SQLite locks on cloud containers
 bot = Client(
     "StreamBot",
     api_id=API_ID,
@@ -31,11 +28,10 @@ bot = Client(
     in_memory=True
 )
 
-# Route 1: Health Check
 async def handle_ping(request):
     return web.Response(text="Telegram Stream Engine is Online!")
 
-# Route 2: Direct Byte-Range Streaming (MKV/MP4/Audio)
+# Direct Video/File Stream with Range Support
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -48,7 +44,6 @@ async def handle_stream(request):
         file_size = media.file_size
         mime_type = media.mime_type or "video/mp4"
 
-        # Check for HTTP Range Header
         range_header = request.headers.get("Range")
         if range_header:
             byte_range = range_header.replace("bytes=", "").split("-")
@@ -59,7 +54,7 @@ async def handle_stream(request):
             to_byte = file_size - 1
 
         content_length = to_byte - from_byte + 1
-        chunk_size = 1024 * 1024  # 1MB chunk size
+        chunk_size = 1024 * 1024
 
         headers = {
             "Content-Type": mime_type,
@@ -78,7 +73,6 @@ async def handle_stream(request):
         )
         await response.prepare(request)
 
-        # Pyrogram streaming offset calculation
         offset = int(math.floor(from_byte / chunk_size))
         bytes_sent = 0
 
@@ -99,15 +93,18 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# Helper: Probe Audio Tracks with ffprobe
-async def get_audio_streams(stream_url):
+# API: Probe Audio Tracks metadata
+async def handle_track_info(request):
     try:
+        msg_id = int(request.match_info["msg_id"])
+        source_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
+        
         cmd = [
             "ffprobe",
             "-v", "error",
             "-show_entries", "stream=index,codec_name,codec_type:stream_tags=language,title",
             "-of", "json",
-            stream_url
+            source_url
         ]
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -116,56 +113,72 @@ async def get_audio_streams(stream_url):
         )
         stdout, _ = await process.communicate()
         data = json.loads(stdout.decode())
-        return [s for s in data.get("streams", []) if s.get("codec_type") == "audio"]
-    except Exception:
-        return []
+        
+        tracks = []
+        audio_idx = 0
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "audio":
+                lang = stream.get("tags", {}).get("language", f"Track {audio_idx + 1}")
+                title = stream.get("tags", {}).get("title", f"Audio {audio_idx + 1} ({lang.upper()})")
+                tracks.append({
+                    "id": audio_idx,
+                    "title": title,
+                    "language": lang
+                })
+                audio_idx += 1
+                
+        return web.json_response({"tracks": tracks}, headers={"Access-Control-Allow-Origin": "*"})
+    except Exception as e:
+        return web.json_response({"tracks": []})
 
-# Route 3: Dynamic HLS Master Playlist (.m3u8)
-async def handle_master_m3u8(request):
+# Route: On-The-Fly Audio Demuxer for Selected Track
+async def handle_audio_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
-        internal_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
-        
-        audio_tracks = await get_audio_streams(internal_url)
-        
-        # Build HLS Master Playlist
-        playlist = "#EXTM3U\n#EXT-X-VERSION:3\n"
-        
-        if len(audio_tracks) > 1:
-            for i, track in enumerate(audio_tracks):
-                lang = track.get("tags", {}).get("language", f"und_{i+1}")
-                title = track.get("tags", {}).get("title", f"Audio Track {i+1} ({lang.upper()})")
-                is_default = "YES" if i == 0 else "NO"
-                
-                playlist += (
-                    f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{title}",'
-                    f'DEFAULT={is_default},AUTOSELECT=YES,LANGUAGE="{lang}",'
-                    f'URI="{FQDN}/watch/{msg_id}"\n'
-                )
-            playlist += (
-                f'#EXT-X-STREAM-INF:BANDWIDTH=4000000,AUDIO="audio"\n'
-                f'{FQDN}/watch/{msg_id}\n'
-            )
-        else:
-            # Single audio track fallback
-            playlist += (
-                f'#EXT-X-STREAM-INF:BANDWIDTH=4000000\n'
-                f'{FQDN}/watch/{msg_id}\n'
-            )
+        track_id = int(request.match_info["track_id"])
+        source_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
 
-        return web.Response(
-            text=playlist,
-            content_type="application/vnd.apple.mpegurl",
-            headers={"Access-Control-Allow-Origin": "*"}
+        cmd = [
+            "ffmpeg",
+            "-i", source_url,
+            "-map", f"0:a:{track_id}",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-f", "adts",
+            "pipe:1"
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
         )
-    except Exception as e:
-        return web.Response(status=500, text=f"Manifest Error: {str(e)}")
 
-# Route 4: Embedded Modern Anime Web Player (Artplayer + Hls.js)
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "audio/aac",
+                "Access-Control-Allow-Origin": "*",
+            }
+        )
+        await response.prepare(request)
+
+        while True:
+            chunk = await process.stdout.read(64 * 1024)
+            if not chunk:
+                break
+            await response.write(chunk)
+
+        await process.wait()
+        return response
+    except Exception as e:
+        return web.Response(status=500, text=str(e))
+
+# Route: Web Player with In-Browser Audio Switcher UI
 async def handle_player(request):
     msg_id = request.match_info["msg_id"]
     stream_url = f"{FQDN}/watch/{msg_id}"
-    hls_url = f"{FQDN}/hls/{msg_id}/master.m3u8"
+    track_info_url = f"{FQDN}/api/tracks/{msg_id}"
     
     html_content = f"""
     <!DOCTYPE html>
@@ -174,14 +187,9 @@ async def handle_player(request):
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Anime Stream Player</title>
-        <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
         <script src="https://cdn.jsdelivr.net/npm/artplayer/dist/artplayer.js"></script>
         <style>
-            * {{
-                box-sizing: border-box;
-                margin: 0;
-                padding: 0;
-            }}
+            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
             body {{
                 background-color: #0b0d14;
                 color: #ffffff;
@@ -191,151 +199,118 @@ async def handle_player(request):
                 justify-content: center;
                 min-height: 100vh;
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                padding: 16px;
+                padding: 12px;
             }}
             .player-wrapper {{
                 width: 100%;
-                max-width: 1080px;
+                max-width: 1000px;
             }}
             .artplayer-app {{
                 width: 100%;
                 aspect-ratio: 16 / 9;
-                border-radius: 12px;
+                border-radius: 10px;
                 overflow: hidden;
-                box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
+                box-shadow: 0 10px 30px rgba(0,0,0,0.8);
             }}
-            .player-actions {{
-                margin-top: 14px;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
+            .status-bar {{
+                margin-top: 10px;
                 font-size: 13px;
-                color: #94a3b8;
-            }}
-            .btn-group {{
-                display: flex;
-                gap: 10px;
-            }}
-            .btn {{
-                background: #1e293b;
-                color: #f1f5f9;
-                text-decoration: none;
-                padding: 8px 14px;
-                border-radius: 6px;
-                font-weight: 500;
-                transition: background 0.2s ease;
-                border: 1px solid #334155;
-            }}
-            .btn:hover {{
-                background: #3b82f6;
-                border-color: #3b82f6;
+                color: #38bdf8;
+                text-align: right;
             }}
         </style>
     </head>
     <body>
         <div class="player-wrapper">
             <div class="artplayer-app"></div>
-            <div class="player-actions">
-                <span>Direct Audio Track Switcher Enabled</span>
-                <div class="btn-group">
-                    <a href="vlc://{stream_url.replace('https://', '').replace('http://', '')}" class="btn">Open in VLC</a>
-                    <a href="{stream_url}" download class="btn">Direct Download</a>
-                </div>
-            </div>
+            <div class="status-bar" id="status-text">Detecting audio streams...</div>
         </div>
 
         <script>
-            var art = new Artplayer({{
+            let externalAudio = new Audio();
+            let isCustomAudioActive = false;
+
+            const art = new Artplayer({{
                 container: '.artplayer-app',
                 url: '{stream_url}',
                 volume: 0.8,
                 isLive: false,
-                muted: false,
                 autoplay: false,
                 pip: true,
-                autoSize: true,
-                autoMini: true,
                 screenshot: true,
                 setting: true,
-                loop: false,
-                flip: true,
                 playbackRate: true,
                 aspectRatio: true,
                 fullscreen: true,
                 fullscreenWeb: true,
-                miniProgressBar: true,
-                mutex: true,
-                backdrop: true,
                 playsInline: true,
-                autoPlayback: true,
-                airplay: true,
-                theme: '#3b82f6',
-                icons: {{
-                    state: '<svg width="60" height="60" viewBox="0 0 48 48" fill="#fff"><path d="M16 10v28l22-14z"/></svg>',
-                }},
-                customType: {{
-                    m3u8: function (video, url, art) {{
-                        if (Hls.isSupported()) {{
-                            const hls = new Hls();
-                            hls.loadSource(url);
-                            hls.attachMedia(video);
-                            art.hls = hls;
+                theme: '#38bdf8'
+            }});
 
-                            hls.on(Hls.Events.MANIFEST_PARSED, function () {{
-                                if (hls.audioTracks && hls.audioTracks.length > 1) {{
-                                    const selectorList = hls.audioTracks.map((track, index) => ({{
-                                        html: track.name || `Audio Track ${{index + 1}}`,
-                                        value: index,
-                                        default: index === hls.audioTrack
-                                    }}));
-
-                                    art.setting.add({{
-                                        width: 200,
-                                        html: 'Audio Track',
-                                        tooltip: 'Select Language',
-                                        selector: selectorList,
-                                        onSelect: function (item) {{
-                                            hls.audioTrack = item.value;
-                                            return item.html;
-                                        }}
-                                    }});
-                                }}
-                            }});
-                        }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-                            video.src = url;
-                        }}
-                    }}
+            // Sync external audio with video
+            art.on('play', () => {{ if (isCustomAudioActive) externalAudio.play(); }});
+            art.on('pause', () => {{ if (isCustomAudioActive) externalAudio.pause(); }});
+            art.on('seek', (time) => {{ if (isCustomAudioActive) externalAudio.currentTime = time; }});
+            art.on('video:volumechange', () => {{
+                if (isCustomAudioActive) {{
+                    externalAudio.volume = art.volume;
+                    externalAudio.muted = art.muted;
                 }}
             }});
 
-            // Native browser audio track detection fallback
-            art.on('ready', () => {{
-                const video = art.template.$video;
-                if (video.audioTracks && video.audioTracks.length > 1) {{
-                    const audioOptions = [];
-                    for (let i = 0; i < video.audioTracks.length; i++) {{
-                        const track = video.audioTracks[i];
-                        audioOptions.push({{
-                            html: track.label || track.language || `Track ${{i + 1}}`,
-                            value: i,
-                            default: track.enabled
-                        }});
-                    }}
+            // Fetch available audio streams
+            fetch('{track_info_url}')
+                .then(res => res.json())
+                .then(data => {{
+                    const tracks = data.tracks || [];
+                    const statusText = document.getElementById('status-text');
 
-                    art.setting.add({{
-                        width: 200,
-                        html: 'Audio Track',
-                        tooltip: 'Select Language',
-                        selector: audioOptions,
-                        onSelect: function (item) {{
-                            for (let i = 0; i < video.audioTracks.length; i++) {{
-                                video.audioTracks[i].enabled = (i === item.value);
+                    if (tracks.length > 0) {{
+                        statusText.innerText = `${{tracks.length}} Audio Track(s) Available`;
+                        
+                        const selectorList = tracks.map((track, idx) => ({{
+                            html: track.title,
+                            value: track.id,
+                            default: idx === 0
+                        }}));
+
+                        art.setting.add({{
+                            width: 220,
+                            html: 'Audio Track',
+                            tooltip: tracks[0].title,
+                            selector: selectorList,
+                            onSelect: function (item) {{
+                                switchAudioTrack(item.value);
+                                return item.html;
                             }}
-                            return item.html;
-                        }}
-                    }});
+                        }});
+                    }} else {{
+                        statusText.innerText = 'Single Audio Stream';
+                    }}
+                }})
+                .catch(() => {{
+                    document.getElementById('status-text').innerText = 'Standard Audio Active';
+                }});
+
+            function switchAudioTrack(trackId) {{
+                const currentTime = art.currentTime;
+                const isPlaying = art.playing;
+
+                if (trackId === 0) {{
+                    // Default internal track
+                    isCustomAudioActive = false;
+                    externalAudio.pause();
+                    art.template.$video.muted = false;
+                }} else {{
+                    // Stream Demuxed Track
+                    isCustomAudioActive = true;
+                    art.template.$video.muted = true;
+                    externalAudio.src = `{FQDN}/audio/{msg_id}/` + trackId;
+                    externalAudio.currentTime = currentTime;
+                    externalAudio.volume = art.volume;
+                    if (isPlaying) externalAudio.play();
                 }}
-            }});
+            }}
         </script>
     </body>
     </html>
@@ -351,12 +326,11 @@ async def start_handler(client: Client, message: Message):
         parse_mode=enums.ParseMode.HTML
     )
 
-# Telegram Media Handler: Auto-forward and generate stream links
+# Telegram Media Handler
 @bot.on_message(filters.private & (filters.document | filters.video | filters.audio))
 async def auto_forward_and_link(client: Client, message: Message):
     try:
         forwarded = await message.forward(chat_id=BIN_CHANNEL)
-
         file_name = "Anime Episode"
         if message.document and message.document.file_name:
             file_name = message.document.file_name
@@ -364,18 +338,15 @@ async def auto_forward_and_link(client: Client, message: Message):
             file_name = message.video.file_name
 
         player_url = f"{FQDN}/player/{forwarded.id}"
-        stream_url = f"{FQDN}/watch/{forwarded.id}"
 
         reply_text = (
             f"<b>File Processed Successfully!</b>\n\n"
             f"<b>Title:</b> <code>{file_name}</code>\n"
-            f"<b>Web Player:</b> <code>{player_url}</code>\n"
-            f"<b>Direct Stream:</b> <code>{stream_url}</code>"
+            f"<b>Web Player:</b> <code>{player_url}</code>"
         )
 
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Watch in Web Player (Multi-Audio)", url=player_url)],
-            [InlineKeyboardButton("Direct Stream Link", url=stream_url)]
+            [InlineKeyboardButton("Watch Online (Multi-Audio)", url=player_url)]
         ])
 
         await message.reply_text(
@@ -392,7 +363,8 @@ async def init_app():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     app.router.add_get("/watch/{msg_id}", handle_stream)
-    app.router.add_get("/hls/{msg_id}/master.m3u8", handle_master_m3u8)
+    app.router.add_get("/api/tracks/{msg_id}", handle_track_info)
+    app.router.add_get("/audio/{msg_id}/{track_id}", handle_audio_stream)
     app.router.add_get("/player/{msg_id}", handle_player)
     return app
 
