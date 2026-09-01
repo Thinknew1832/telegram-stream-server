@@ -54,7 +54,7 @@ async def handle_stream(request):
             to_byte = file_size - 1
 
         content_length = to_byte - from_byte + 1
-        chunk_size = 1024 * 1024
+        chunk_size = 1024 * 1024  # 1MB buffer chunk
 
         headers = {
             "Content-Type": mime_type,
@@ -93,7 +93,7 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# API: Probe all available audio streams and language titles
+# API: Fast probe of audio streams
 async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -102,6 +102,8 @@ async def handle_track_info(request):
         cmd = [
             "ffprobe",
             "-v", "error",
+            "-probesize", "5000000",
+            "-analyzeduration", "2000000",
             "-show_entries", "stream=index,codec_name,codec_type:stream_tags=language,title",
             "-of", "json",
             source_url
@@ -131,7 +133,7 @@ async def handle_track_info(request):
     except Exception:
         return web.json_response({"tracks": []})
 
-# Dynamic Audio Remux Stream (Zero CPU video copy + selected audio stream)
+# High-Speed Remux Stream (Zero Transcoding Latency)
 async def handle_remux_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -139,6 +141,7 @@ async def handle_remux_stream(request):
         source_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
         seek_time = request.query.get("ss", "0")
 
+        # Ultra-fast pipeline: Accurate fast seek + stream copy
         cmd = [
             "ffmpeg",
             "-ss", str(seek_time),
@@ -146,10 +149,9 @@ async def handle_remux_stream(request):
             "-map", "0:v:0",
             "-map", f"0:a:{track_id}",
             "-c:v", "copy",
-            "-c:a", "aac",
-            "-b:a", "192k",
+            "-c:a", "copy",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof+faststart",
             "-f", "mp4",
-            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
             "pipe:1"
         ]
 
@@ -164,12 +166,13 @@ async def handle_remux_stream(request):
             headers={
                 "Content-Type": "video/mp4",
                 "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-cache"
             }
         )
         await response.prepare(request)
 
         while True:
-            chunk = await process.stdout.read(128 * 1024)
+            chunk = await process.stdout.read(256 * 1024)
             if not chunk:
                 break
             await response.write(chunk)
@@ -228,7 +231,7 @@ async def handle_player(request):
     <body>
         <div class="player-wrapper">
             <div class="artplayer-app"></div>
-            <div class="status-bar" id="status-text">Detecting audio streams...</div>
+            <div class="status-bar" id="status-text">Loading stream info...</div>
         </div>
 
         <script>
