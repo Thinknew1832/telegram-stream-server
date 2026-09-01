@@ -31,7 +31,7 @@ bot = Client(
 async def handle_ping(request):
     return web.Response(text="Telegram Stream Engine is Online!")
 
-# Direct Video/File Stream with Range Support
+# Direct Telegram Byte Stream (Default)
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -93,12 +93,12 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# API: Probe Audio Tracks metadata
+# API: Probe all available audio streams and language titles
 async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
         source_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
-        
+
         cmd = [
             "ffprobe",
             "-v", "error",
@@ -113,38 +113,43 @@ async def handle_track_info(request):
         )
         stdout, _ = await process.communicate()
         data = json.loads(stdout.decode())
-        
+
         tracks = []
         audio_idx = 0
         for stream in data.get("streams", []):
             if stream.get("codec_type") == "audio":
-                lang = stream.get("tags", {}).get("language", f"Track {audio_idx + 1}")
-                title = stream.get("tags", {}).get("title", f"Audio {audio_idx + 1} ({lang.upper()})")
+                tags = stream.get("tags", {})
+                title = tags.get("title") or tags.get("language") or f"Audio Track {audio_idx + 1}"
+                lang = tags.get("language", "und").upper()
                 tracks.append({
                     "id": audio_idx,
-                    "title": title,
-                    "language": lang
+                    "title": f"{title} [{lang}]" if lang != "UND" else title
                 })
                 audio_idx += 1
-                
+
         return web.json_response({"tracks": tracks}, headers={"Access-Control-Allow-Origin": "*"})
-    except Exception as e:
+    except Exception:
         return web.json_response({"tracks": []})
 
-# Route: On-The-Fly Audio Demuxer for Selected Track
-async def handle_audio_stream(request):
+# Dynamic Audio Remux Stream (Zero CPU video copy + selected audio stream)
+async def handle_remux_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
         track_id = int(request.match_info["track_id"])
         source_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
+        seek_time = request.query.get("ss", "0")
 
         cmd = [
             "ffmpeg",
+            "-ss", str(seek_time),
             "-i", source_url,
+            "-map", "0:v:0",
             "-map", f"0:a:{track_id}",
+            "-c:v", "copy",
             "-c:a", "aac",
             "-b:a", "192k",
-            "-f", "adts",
+            "-f", "mp4",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
             "pipe:1"
         ]
 
@@ -157,14 +162,14 @@ async def handle_audio_stream(request):
         response = web.StreamResponse(
             status=200,
             headers={
-                "Content-Type": "audio/aac",
+                "Content-Type": "video/mp4",
                 "Access-Control-Allow-Origin": "*",
             }
         )
         await response.prepare(request)
 
         while True:
-            chunk = await process.stdout.read(64 * 1024)
+            chunk = await process.stdout.read(128 * 1024)
             if not chunk:
                 break
             await response.write(chunk)
@@ -174,12 +179,12 @@ async def handle_audio_stream(request):
     except Exception as e:
         return web.Response(status=500, text=str(e))
 
-# Route: Web Player with In-Browser Audio Switcher UI
+# Route: Web Player
 async def handle_player(request):
     msg_id = request.match_info["msg_id"]
     stream_url = f"{FQDN}/watch/{msg_id}"
     track_info_url = f"{FQDN}/api/tracks/{msg_id}"
-    
+
     html_content = f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -191,7 +196,7 @@ async def handle_player(request):
         <style>
             * {{ box-sizing: border-box; margin: 0; padding: 0; }}
             body {{
-                background-color: #0b0d14;
+                background-color: #080a10;
                 color: #ffffff;
                 display: flex;
                 flex-direction: column;
@@ -203,14 +208,14 @@ async def handle_player(request):
             }}
             .player-wrapper {{
                 width: 100%;
-                max-width: 1000px;
+                max-width: 1050px;
             }}
             .artplayer-app {{
                 width: 100%;
                 aspect-ratio: 16 / 9;
                 border-radius: 10px;
                 overflow: hidden;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+                box-shadow: 0 10px 40px rgba(0,0,0,0.85);
             }}
             .status-bar {{
                 margin-top: 10px;
@@ -227,12 +232,12 @@ async def handle_player(request):
         </div>
 
         <script>
-            let externalAudio = new Audio();
-            let isCustomAudioActive = false;
+            let currentTrack = 0;
+            const originalUrl = '{stream_url}';
 
             const art = new Artplayer({{
                 container: '.artplayer-app',
-                url: '{stream_url}',
+                url: originalUrl,
                 volume: 0.8,
                 isLive: false,
                 autoplay: false,
@@ -247,18 +252,6 @@ async def handle_player(request):
                 theme: '#38bdf8'
             }});
 
-            // Sync external audio with video
-            art.on('play', () => {{ if (isCustomAudioActive) externalAudio.play(); }});
-            art.on('pause', () => {{ if (isCustomAudioActive) externalAudio.pause(); }});
-            art.on('seek', (time) => {{ if (isCustomAudioActive) externalAudio.currentTime = time; }});
-            art.on('video:volumechange', () => {{
-                if (isCustomAudioActive) {{
-                    externalAudio.volume = art.volume;
-                    externalAudio.muted = art.muted;
-                }}
-            }});
-
-            // Fetch available audio streams
             fetch('{track_info_url}')
                 .then(res => res.json())
                 .then(data => {{
@@ -267,7 +260,7 @@ async def handle_player(request):
 
                     if (tracks.length > 0) {{
                         statusText.innerText = `${{tracks.length}} Audio Track(s) Available`;
-                        
+
                         const selectorList = tracks.map((track, idx) => ({{
                             html: track.title,
                             value: track.id,
@@ -275,40 +268,37 @@ async def handle_player(request):
                         }}));
 
                         art.setting.add({{
-                            width: 220,
+                            width: 240,
                             html: 'Audio Track',
                             tooltip: tracks[0].title,
                             selector: selectorList,
                             onSelect: function (item) {{
-                                switchAudioTrack(item.value);
+                                if (item.value !== currentTrack) {{
+                                    currentTrack = item.value;
+                                    switchAudioStream(item.value);
+                                }}
                                 return item.html;
                             }}
                         }});
                     }} else {{
                         statusText.innerText = 'Single Audio Stream';
                     }}
-                }})
-                .catch(() => {{
-                    document.getElementById('status-text').innerText = 'Standard Audio Active';
                 }});
 
-            function switchAudioTrack(trackId) {{
-                const currentTime = art.currentTime;
-                const isPlaying = art.playing;
+            function switchAudioStream(trackId) {{
+                const currentTime = Math.floor(art.currentTime);
+                art.notice.show = 'Switching audio track...';
 
                 if (trackId === 0) {{
-                    // Default internal track
-                    isCustomAudioActive = false;
-                    externalAudio.pause();
-                    art.template.$video.muted = false;
+                    art.switchUrl(originalUrl).then(() => {{
+                        art.currentTime = currentTime;
+                        art.play();
+                    }});
                 }} else {{
-                    // Stream Demuxed Track
-                    isCustomAudioActive = true;
-                    art.template.$video.muted = true;
-                    externalAudio.src = `{FQDN}/audio/{msg_id}/` + trackId;
-                    externalAudio.currentTime = currentTime;
-                    externalAudio.volume = art.volume;
-                    if (isPlaying) externalAudio.play();
+                    const remuxUrl = `{FQDN}/remux/{msg_id}/${{trackId}}?ss=${{currentTime}}`;
+                    art.switchUrl(remuxUrl).then(() => {{
+                        art.play();
+                    }});
                 }}
             }}
         </script>
@@ -364,7 +354,7 @@ async def init_app():
     app.router.add_get("/", handle_ping)
     app.router.add_get("/watch/{msg_id}", handle_stream)
     app.router.add_get("/api/tracks/{msg_id}", handle_track_info)
-    app.router.add_get("/audio/{msg_id}/{track_id}", handle_audio_stream)
+    app.router.add_get("/remux/{msg_id}/{track_id}", handle_remux_stream)
     app.router.add_get("/player/{msg_id}", handle_player)
     return app
 
