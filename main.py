@@ -1,30 +1,39 @@
 import os
 import math
+import sys
 from aiohttp import web
 from pyrogram import Client, filters, enums
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 # Environment Configurations
 API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+API_HASH = os.getenv("API_HASH", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 BIN_CHANNEL = int(os.getenv("BIN_CHANNEL", "0"))
 PORT = int(os.getenv("PORT", "8080"))
 BIND_ADDRESS = os.getenv("BIND_ADDRESS", "0.0.0.0")
 FQDN = os.getenv("FQDN", f"http://localhost:{PORT}").rstrip("/")
 
+# Basic credentials validation
+if not API_ID or not API_HASH or not BOT_TOKEN or not BIN_CHANNEL:
+    print("\n[CRITICAL ERROR] Missing mandatory environment variables!")
+    print("Please configure API_ID, API_HASH, BOT_TOKEN, and BIN_CHANNEL in your cloud dashboard.\n")
+    sys.exit(1)
+
+# In-memory session prevents SQLite locks on cloud containers
 bot = Client(
     "StreamBot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    in_memory=True
 )
 
 # Route 1: Health check
 async def handle_ping(request):
     return web.Response(text="Telegram Stream Engine is Online!")
 
-# Route 2: Video Stream Handler with HTTP Range & Seeking Support
+# Route 2: Video Stream Handler (Supports GET & HEAD with Range Headers)
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -37,6 +46,7 @@ async def handle_stream(request):
         file_size = media.file_size
         mime_type = media.mime_type or "video/mp4"
 
+        # Check for HTTP Range Header
         range_header = request.headers.get("Range")
         if range_header:
             byte_range = range_header.replace("bytes=", "").split("-")
@@ -49,24 +59,30 @@ async def handle_stream(request):
         content_length = to_byte - from_byte + 1
         chunk_size = 1024 * 1024  # 1MB chunk size
 
+        headers = {
+            "Content-Type": mime_type,
+            "Content-Range": f"bytes {from_byte}-{to_byte}/{file_size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(content_length),
+            "Access-Control-Allow-Origin": "*",
+        }
+
+        # Support HEAD requests for media player metadata checks
+        if request.method == "HEAD":
+            return web.Response(status=200, headers=headers)
+
         response = web.StreamResponse(
             status=206 if range_header else 200,
-            headers={
-                "Content-Type": mime_type,
-                "Content-Range": f"bytes {from_byte}-{to_byte}/{file_size}",
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(content_length),
-                "Access-Control-Allow-Origin": "*",
-            }
+            headers=headers
         )
         await response.prepare(request)
 
-        # Calculate starting chunk offset for Pyrogram stream
+        # Pyrogram streaming offset calculation
         offset = int(math.floor(from_byte / chunk_size))
         bytes_sent = 0
 
         async for chunk in bot.stream_media(msg, offset=offset):
-            # Trim chunk if from_byte falls within the first chunk
+            # Trim chunk start if range does not align with chunk boundary
             if bytes_sent == 0 and (from_byte % chunk_size) != 0:
                 chunk = chunk[(from_byte % chunk_size):]
 
@@ -87,8 +103,8 @@ async def handle_stream(request):
 @bot.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     await message.reply_text(
-        "<b>Telegram Stream Bot is Active!</b>\n\n"
-        "Send or forward any video or document to get direct high-speed streaming links.",
+        "<b>Telegram Stream Engine is Online!</b>\n\n"
+        "Send or forward any video/file to get an instant, high-speed streaming link.",
         parse_mode=enums.ParseMode.HTML
     )
 
@@ -98,7 +114,7 @@ async def auto_forward_and_link(client: Client, message: Message):
     try:
         forwarded = await message.forward(chat_id=BIN_CHANNEL)
         
-        file_name = "Video"
+        file_name = "Video File"
         if message.document and message.document.file_name:
             file_name = message.document.file_name
         elif message.video and message.video.file_name:
@@ -109,22 +125,28 @@ async def auto_forward_and_link(client: Client, message: Message):
         reply_text = (
             f"<b>File Processed Successfully!</b>\n\n"
             f"<b>File Name:</b> <code>{file_name}</code>\n"
-            f"<b>Stream Link:</b> <code>{stream_url}</code>\n\n"
-            f"<a href=\"{stream_url}\">Click to Stream</a>"
+            f"<b>Stream URL:</b> <code>{stream_url}</code>"
         )
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Stream / Watch Online", url=stream_url)]
+        ])
+
         await message.reply_text(
             reply_text,
             parse_mode=enums.ParseMode.HTML,
+            reply_markup=keyboard,
             disable_web_page_preview=True
         )
     except Exception as e:
         await message.reply_text(f"Error processing file: {str(e)}")
 
-# Web App Startup
+# Web App Initialization
 async def init_app():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     app.router.add_get("/watch/{msg_id}", handle_stream)
+    app.router.add_route("HEAD", "/watch/{msg_id}", handle_stream)
     return app
 
 if __name__ == "__main__":
@@ -138,7 +160,7 @@ if __name__ == "__main__":
         await runner.setup()
         site = web.TCPSite(runner, BIND_ADDRESS, PORT)
         await site.start()
-        print(f"Server running at http://{BIND_ADDRESS}:{PORT}")
+        print(f"Streaming server live at http://{BIND_ADDRESS}:{PORT}")
         await asyncio.Event().wait()
 
     loop.run_until_complete(run())
