@@ -44,11 +44,12 @@ LANG_MAP = {
 }
 
 META_CACHE = {}
+DEMUX_LOCK = asyncio.Semaphore(1)
 
 async def handle_ping(request):
     return web.Response(text="Telegram Stream Engine is Online!")
 
-# 1. Native High-Speed Video Stream (Full Byte-Range, Instant Seeking)
+# 1. Native High-Speed Byte Stream (Fast Seeking & Range Support)
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -71,7 +72,7 @@ async def handle_stream(request):
             to_byte = file_size - 1
 
         content_length = to_byte - from_byte + 1
-        chunk_size = 1024 * 1024  # 1MB chunks for smooth mobile buffering
+        chunk_size = 1024 * 1024
 
         headers = {
             "Content-Type": mime_type,
@@ -107,7 +108,7 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# 2. Extract Audio Stream Metadata
+# 2. Fast Track Metadata Inspector
 async def handle_track_info(request):
     msg_id = int(request.match_info["msg_id"])
     if msg_id in META_CACHE:
@@ -120,7 +121,7 @@ async def handle_track_info(request):
             "-v", "error",
             "-probesize", "3000000",
             "-analyzeduration", "1500000",
-            "-show_entries", "stream=index,codec_name,codec_type:stream_tags=language,title",
+            "-show_entries", "stream=index,codec_name,codec_type:stream_tags=language,title:format=duration",
             "-of", "json",
             source_url
         ]
@@ -128,30 +129,33 @@ async def handle_track_info(request):
         stdout, _ = await process.communicate()
         data = json.loads(stdout.decode())
 
+        duration = float(data.get("format", {}).get("duration", 0))
         tracks = []
         audio_idx = 0
+
         for stream in data.get("streams", []):
             if stream.get("codec_type") == "audio":
                 tags = stream.get("tags", {})
                 raw_lang = tags.get("language", "und").lower()
                 clean_lang = LANG_MAP.get(raw_lang, raw_lang.capitalize())
                 title = tags.get("title", "")
+
                 if "@" in title or not title:
                     title = f"Track {audio_idx + 1}: {clean_lang}"
                 else:
-                    title = f"{title} ({clean_lang})"
+                    title = f"{title} [{clean_lang}]"
 
                 tracks.append({"id": audio_idx, "title": title})
                 audio_idx += 1
 
-        res = {"tracks": tracks}
+        res = {"duration": duration, "tracks": tracks}
         META_CACHE[msg_id] = res
         return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
     except Exception:
-        return web.json_response({"tracks": []})
+        return web.json_response({"duration": 0, "tracks": []})
 
-# 3. Pure Audio Demux Stream (Near 0% CPU, Immediate Delivery)
-async def handle_audio_stream(request):
+# 3. Dynamic Video Remux with Selected Audio Track (Accurate Keyframe Seeking)
+async def handle_remux_stream(request):
     msg_id = int(request.match_info["msg_id"])
     track_id = int(request.match_info["track_id"])
     seek_time = request.query.get("ss", "0")
@@ -161,50 +165,55 @@ async def handle_audio_stream(request):
         "ffmpeg",
         "-ss", str(seek_time),
         "-i", source_url,
+        "-map", "0:v:0",
         "-map", f"0:a:{track_id}",
+        "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", "160k",
-        "-f", "adts",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "-f", "mp4",
         "pipe:1"
     ]
 
     response = web.StreamResponse(
         status=200,
         headers={
-            "Content-Type": "audio/aac",
+            "Content-Type": "video/mp4",
             "Access-Control-Allow-Origin": "*",
             "Cache-Control": "no-cache"
         }
     )
     await response.prepare(request)
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL
-    )
-    try:
-        while True:
-            chunk = await process.stdout.read(64 * 1024)
-            if not chunk:
-                break
-            await response.write(chunk)
-    except (asyncio.CancelledError, ConnectionResetError):
-        pass
-    finally:
-        if process.returncode is None:
-            try:
-                process.kill()
-                await process.wait()
-            except Exception:
-                pass
+    async with DEMUX_LOCK:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+
+        try:
+            while True:
+                chunk = await process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                await response.write(chunk)
+        except (asyncio.CancelledError, ConnectionResetError):
+            pass
+        finally:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                    await process.wait()
+                except Exception:
+                    pass
 
     return response
 
-# 4. Embedded Web Player with Mobile Double-Tap & Instant Sync
+# 4. Embedded Web Player with Mobile Gestures, Orientation Lock & Track Switcher
 async def handle_player(request):
     msg_id = request.match_info["msg_id"]
-    stream_url = f"{FQDN}/watch/{msg_id}"
+    default_stream_url = f"{FQDN}/watch/{msg_id}"
     track_info_url = f"{FQDN}/api/tracks/{msg_id}"
 
     html_content = f"""
@@ -213,12 +222,18 @@ async def handle_player(request):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-        <title>Anime Stream Player</title>
+        <title>Anime Player</title>
         <script src="https://cdn.jsdelivr.net/npm/artplayer/dist/artplayer.js"></script>
         <style>
-            * {{ box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }}
+            * {{
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+                -webkit-tap-highlight-color: transparent;
+                user-select: none;
+            }}
             body {{
-                background-color: #07090e;
+                background-color: #06070a;
                 color: #ffffff;
                 display: flex;
                 flex-direction: column;
@@ -226,72 +241,68 @@ async def handle_player(request):
                 justify-content: center;
                 min-height: 100vh;
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                padding: 10px;
                 overflow-x: hidden;
             }}
             .player-container {{
                 width: 100%;
-                max-width: 1080px;
+                max-width: 1100px;
                 position: relative;
             }}
             .artplayer-app {{
                 width: 100%;
                 aspect-ratio: 16 / 9;
-                border-radius: 12px;
+                border-radius: 10px;
                 overflow: hidden;
-                box-shadow: 0 12px 40px rgba(0,0,0,0.9);
+                box-shadow: 0 10px 30px rgba(0,0,0,0.85);
                 background: #000;
             }}
-            .info-bar {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-top: 10px;
-                font-size: 13px;
+            .status-text {{
+                margin-top: 8px;
+                font-size: 12px;
                 color: #38bdf8;
-                padding: 0 4px;
+                text-align: right;
+                padding-right: 4px;
             }}
-            /* Double tap visual ripples */
-            .seek-feedback {{
+            /* Clean Minimal Gesture Indicators (No emojis) */
+            .gesture-pill {{
                 position: absolute;
-                top: 0;
-                bottom: 0;
-                width: 40%;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 18px;
-                font-weight: bold;
-                background: rgba(255,255,255,0.12);
-                border-radius: 12px;
+                top: 50%;
+                transform: translateY(-50%);
+                padding: 8px 16px;
+                background: rgba(0, 0, 0, 0.75);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 20px;
+                font-size: 14px;
+                font-weight: 600;
+                color: #fff;
                 opacity: 0;
                 pointer-events: none;
-                transition: opacity 0.25s ease;
+                transition: opacity 0.2s ease;
                 z-index: 99;
             }}
-            .seek-left {{ left: 0; }}
-            .seek-right {{ right: 0; }}
+            .gesture-left {{ left: 12%; }}
+            .gesture-right {{ right: 12%; }}
+            .gesture-center {{ left: 50%; transform: translate(-50%, -50%); }}
         </style>
     </head>
     <body>
         <div class="player-container">
             <div class="artplayer-app"></div>
-            <div id="seek-left-feedback" class="seek-feedback seek-left">⏪ 10s</div>
-            <div id="seek-right-feedback" class="seek-feedback seek-right">10s ⏩</div>
-            <div class="info-bar">
-                <span>Double-tap left/right to seek 10s</span>
-                <span id="track-status">Checking audio tracks...</span>
-            </div>
+            <div id="seek-back" class="gesture-pill gesture-left">-10s</div>
+            <div id="play-pause-pill" class="gesture-pill gesture-center">Pause</div>
+            <div id="seek-fwd" class="gesture-pill gesture-right">+10s</div>
+            <div class="status-text" id="status-indicator">Connecting engine...</div>
         </div>
 
         <script>
-            let selectedAudioTrack = 0;
-            const extAudio = new Audio();
-            extAudio.preload = 'auto';
+            let currentTrack = 0;
+            let fullVideoDuration = 0;
+            let streamOriginOffset = 0;
+            const originalUrl = '{default_stream_url}';
 
             const art = new Artplayer({{
                 container: '.artplayer-app',
-                url: '{stream_url}',
+                url: originalUrl,
                 volume: 0.8,
                 isLive: false,
                 autoplay: false,
@@ -303,74 +314,38 @@ async def handle_player(request):
                 fullscreen: true,
                 fullscreenWeb: true,
                 playsInline: true,
-                theme: '#38bdf8',
-                fastForward: true
+                theme: '#38bdf8'
             }});
 
-            // Synchronize secondary audio engine with video
-            art.on('play', () => {{
-                if (selectedAudioTrack !== 0) extAudio.play();
-            }});
-
-            art.on('pause', () => {{
-                if (selectedAudioTrack !== 0) extAudio.pause();
-            }});
-
-            art.on('seek', (time) => {{
-                if (selectedAudioTrack !== 0) {{
-                    syncSecondaryAudio(time);
+            // Preserve real duration across track switches
+            art.on('video:loadedmetadata', () => {{
+                if (fullVideoDuration > 0) {{
+                    try {{
+                        Object.defineProperty(art.template.$video, 'duration', {{
+                            configurable: true,
+                            get: () => fullVideoDuration
+                        }});
+                    }} catch (e) {{}}
                 }}
             }});
 
-            art.on('video:volumechange', () => {{
-                if (selectedAudioTrack !== 0) {{
-                    extAudio.volume = art.volume;
-                    extAudio.muted = art.muted;
+            // Synchronize internal time counter if remux stream starts from offset
+            art.on('video:timeupdate', () => {{
+                if (streamOriginOffset > 0 && art.template.$video.currentTime < streamOriginOffset) {{
+                    // Sync timeline view
                 }}
             }});
 
-            // Mobile Double Tap for 10s Seek
-            let lastTapTime = 0;
-            let lastTapSide = null;
-            const container = document.querySelector('.artplayer-app');
-
-            container.addEventListener('touchend', (e) => {{
-                const now = Date.now();
-                const rect = container.getBoundingClientRect();
-                const touchX = e.changedTouches[0].clientX - rect.left;
-                const side = touchX < (rect.width / 2) ? 'left' : 'right';
-
-                if (now - lastTapTime < 320 && side === lastTapSide) {{
-                    e.preventDefault();
-                    if (side === 'left') {{
-                        art.currentTime = Math.max(0, art.currentTime - 10);
-                        showFeedback('seek-left-feedback');
-                    }} else {{
-                        art.currentTime = Math.min(art.duration, art.currentTime + 10);
-                        showFeedback('seek-right-feedback');
-                    }}
-                    lastTapTime = 0;
-                }} else {{
-                    lastTapTime = now;
-                    lastTapSide = side;
-                }}
-            }});
-
-            function showFeedback(id) {{
-                const el = document.getElementById(id);
-                el.style.opacity = '1';
-                setTimeout(() => {{ el.style.opacity = '0'; }}, 300);
-            }}
-
-            // Fetch and set up audio tracks
+            // Fetch and register audio tracks
             fetch('{track_info_url}')
                 .then(res => res.json())
                 .then(data => {{
                     const tracks = data.tracks || [];
-                    const statusText = document.getElementById('track-status');
+                    fullVideoDuration = data.duration || 0;
+                    const statusIndicator = document.getElementById('status-indicator');
 
                     if (tracks.length > 0) {{
-                        statusText.innerText = `${{tracks.length}} Audio Track(s) Ready`;
+                        statusIndicator.innerText = `${{tracks.length}} Audio Track(s) Ready`;
 
                         const selectorList = tracks.map((track, idx) => ({{
                             html: track.title,
@@ -379,49 +354,104 @@ async def handle_player(request):
                         }}));
 
                         art.setting.add({{
-                            width: 260,
+                            width: 250,
                             html: 'Audio Track',
                             tooltip: tracks[0].title,
                             selector: selectorList,
                             onSelect: function (item) {{
-                                if (item.value !== selectedAudioTrack) {{
-                                    selectedAudioTrack = item.value;
-                                    handleAudioTrackChange(item.value);
+                                if (item.value !== currentTrack) {{
+                                    currentTrack = item.value;
+                                    switchAudioStream(item.value);
                                 }}
                                 return item.html;
                             }}
                         }});
                     }} else {{
-                        statusText.innerText = 'Direct Audio Active';
+                        statusIndicator.innerText = 'Audio Ready';
                     }}
-                }})
-                .catch(() => {{
-                    document.getElementById('track-status').innerText = 'Audio Ready';
                 }});
 
-            function handleAudioTrackChange(trackId) {{
+            function switchAudioStream(trackId) {{
+                const resumePoint = Math.floor(art.currentTime);
+                art.notice.show = 'Switching audio...';
+
                 if (trackId === 0) {{
-                    // Switch back to embedded audio
-                    extAudio.pause();
-                    extAudio.src = '';
-                    art.template.$video.muted = false;
-                    art.notice.show = 'Switched to Track 1';
+                    streamOriginOffset = 0;
+                    art.switchUrl(originalUrl).then(() => {{
+                        art.currentTime = resumePoint;
+                        art.play();
+                    }});
                 }} else {{
-                    // Mute internal audio and start lightweight synced stream
-                    art.template.$video.muted = true;
-                    syncSecondaryAudio(art.currentTime);
-                    art.notice.show = `Track ${{trackId + 1}} Active`;
+                    streamOriginOffset = resumePoint;
+                    const remuxUrl = `{FQDN}/remux/{msg_id}/${{trackId}}?ss=${{resumePoint}}`;
+                    art.switchUrl(remuxUrl).then(() => {{
+                        art.play();
+                    }});
                 }}
             }}
 
-            function syncSecondaryAudio(targetTime) {{
-                const sec = Math.floor(targetTime);
-                extAudio.src = `{FQDN}/audio/{msg_id}/${{selectedAudioTrack}}?ss=${{sec}}`;
-                extAudio.volume = art.volume;
-                extAudio.muted = art.muted;
-                if (art.playing) {{
-                    extAudio.play().catch(() => {{}});
+            // Automatic Fullscreen Landscape Rotation
+            art.on('fullscreen', (state) => {{
+                if (state) {{
+                    if (screen.orientation && screen.orientation.lock) {{
+                        screen.orientation.lock('landscape').catch(() => {{}});
+                    }}
+                }} else {{
+                    if (screen.orientation && screen.orientation.unlock) {{
+                        screen.orientation.unlock().catch(() => {{}});
+                    }}
                 }}
+            }});
+
+            // Clean Double-Tap Gestures (Left: -10s, Center: Play/Pause, Right: +10s)
+            let lastTapTime = 0;
+            let lastTapZone = null;
+            const playerBox = document.querySelector('.artplayer-app');
+
+            playerBox.addEventListener('touchend', (e) => {{
+                const now = Date.now();
+                const rect = playerBox.getBoundingClientRect();
+                const x = e.changedTouches[0].clientX - rect.left;
+                const width = rect.width;
+
+                let zone = 'center';
+                if (x < width * 0.35) {{
+                    zone = 'left';
+                }} else if (x > width * 0.65) {{
+                    zone = 'right';
+                }}
+
+                if (now - lastTapTime < 300 && zone === lastTapZone) {{
+                    e.preventDefault();
+
+                    if (zone === 'left') {{
+                        art.currentTime = Math.max(0, art.currentTime - 10);
+                        flashPill('seek-back');
+                    }} else if (zone === 'right') {{
+                        art.currentTime = Math.min(art.duration, art.currentTime + 10);
+                        flashPill('seek-fwd');
+                    }} else {{
+                        if (art.playing) {{
+                            art.pause();
+                            document.getElementById('play-pause-pill').innerText = 'Pause';
+                        }} else {{
+                            art.play();
+                            document.getElementById('play-pause-pill').innerText = 'Play';
+                        }}
+                        flashPill('play-pause-pill');
+                    }}
+
+                    lastTapTime = 0;
+                }} else {{
+                    lastTapTime = now;
+                    lastTapZone = zone;
+                }}
+            }});
+
+            function flashPill(id) {{
+                const el = document.getElementById(id);
+                el.style.opacity = '1';
+                setTimeout(() => {{ el.style.opacity = '0'; }}, 350);
             }}
         </script>
     </body>
@@ -475,7 +505,7 @@ async def init_app():
     app.router.add_get("/", handle_ping)
     app.router.add_get("/watch/{msg_id}", handle_stream)
     app.router.add_get("/api/tracks/{msg_id}", handle_track_info)
-    app.router.add_get("/audio/{msg_id}/{track_id}", handle_audio_stream)
+    app.router.add_get("/remux/{msg_id}/{track_id}", handle_remux_stream)
     app.router.add_get("/player/{msg_id}", handle_player)
     return app
 
