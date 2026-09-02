@@ -40,13 +40,13 @@ LANG_MAP = {
     "spa": "Spanish",
     "fra": "French",
     "ger": "German",
-    "und": "Default Track"
+    "und": "Default"
 }
 
 async def handle_ping(request):
     return web.Response(text="Telegram Stream Engine is Online!")
 
-# Direct Telegram Byte Stream (Fast seekable range stream)
+# Direct Telegram Byte Stream
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -82,10 +82,7 @@ async def handle_stream(request):
         if request.method == "HEAD":
             return web.Response(status=200, headers=headers)
 
-        response = web.StreamResponse(
-            status=206 if range_header else 200,
-            headers=headers
-        )
+        response = web.StreamResponse(status=206 if range_header else 200, headers=headers)
         await response.prepare(request)
 
         offset = int(math.floor(from_byte / chunk_size))
@@ -108,87 +105,150 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# API: Probe Audio Tracks and Resolve Real Language Names
+# Inspect Audio Streams
+async def get_audio_tracks_meta(msg_id):
+    source_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-probesize", "5000000",
+        "-analyzeduration", "2000000",
+        "-show_entries", "stream=index,codec_name,codec_type:stream_tags=language,title:format=duration",
+        "-of", "json",
+        source_url
+    ]
+    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    stdout, _ = await process.communicate()
+    data = json.loads(stdout.decode())
+    
+    duration = float(data.get("format", {}).get("duration", 0))
+    tracks = []
+    audio_idx = 0
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "audio":
+            tags = stream.get("tags", {})
+            raw_lang = tags.get("language", "und").lower()
+            clean_lang = LANG_MAP.get(raw_lang, raw_lang.capitalize())
+            title = tags.get("title", "")
+            if "@" in title or not title:
+                name = f"{clean_lang}"
+            else:
+                name = f"{title} ({clean_lang})"
+            tracks.append({"id": audio_idx, "name": name, "lang": raw_lang})
+            audio_idx += 1
+    return tracks, duration
+
+# API to fetch tracks list
 async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
-        source_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
-
-        cmd = [
-            "ffprobe",
-            "-v", "error",
-            "-probesize", "5000000",
-            "-analyzeduration", "2000000",
-            "-show_entries", "stream=index,codec_name,codec_type:stream_tags=language,title",
-            "-of", "json",
-            source_url
-        ]
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await process.communicate()
-        data = json.loads(stdout.decode())
-
-        tracks = []
-        audio_idx = 0
-        for stream in data.get("streams", []):
-            if stream.get("codec_type") == "audio":
-                tags = stream.get("tags", {})
-                raw_lang = tags.get("language", "und").lower()
-                clean_lang = LANG_MAP.get(raw_lang, raw_lang.capitalize())
-                
-                # Strip promotional text if present
-                title = tags.get("title", "")
-                if "@" in title or not title:
-                    title = f"Track {audio_idx + 1}: {clean_lang}"
-                else:
-                    title = f"{title} ({clean_lang})"
-
-                tracks.append({
-                    "id": audio_idx,
-                    "title": title
-                })
-                audio_idx += 1
-
+        tracks, _ = await get_audio_tracks_meta(msg_id)
         return web.json_response({"tracks": tracks}, headers={"Access-Control-Allow-Origin": "*"})
     except Exception:
         return web.json_response({"tracks": []})
 
-# Route: Fast Audio-Only Stream (Low CPU, Immediate Start)
-async def handle_audio_stream(request):
+# HLS Master Playlist (Standard Multi-Audio spec)
+async def handle_master_playlist(request):
     try:
         msg_id = int(request.match_info["msg_id"])
-        track_id = int(request.match_info["track_id"])
+        tracks, _ = await get_audio_tracks_meta(msg_id)
+
+        playlist = "#EXTM3U\n#EXT-X-VERSION:4\n\n"
+
+        for track in tracks:
+            t_id = track["id"]
+            name = track["name"]
+            lang = track["lang"]
+            is_default = "YES" if t_id == 0 else "NO"
+            playlist += (
+                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-group",NAME="{name}",'
+                f'DEFAULT={is_default},AUTOSELECT=YES,LANGUAGE="{lang}",'
+                f'URI="{FQDN}/hls/{msg_id}/audio_{t_id}.m3u8"\n'
+            )
+
+        playlist += (
+            f'\n#EXT-X-STREAM-INF:BANDWIDTH=3500000,AUDIO="audio-group"\n'
+            f'{FQDN}/hls/{msg_id}/video.m3u8\n'
+        )
+
+        return web.Response(
+            text=playlist,
+            content_type="application/vnd.apple.mpegurl",
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+    except Exception as e:
+        return web.Response(status=500, text=str(e))
+
+# Segmented Video Playlist
+async def handle_video_playlist(request):
+    msg_id = int(request.match_info["msg_id"])
+    _, duration = await get_audio_tracks_meta(msg_id)
+    seg_duration = 6
+    num_segs = int(math.ceil(duration / seg_duration)) if duration > 0 else 240
+
+    playlist = "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:0\n\n"
+    for i in range(num_segs):
+        playlist += f"#EXTINF:{seg_duration}.0,\n"
+        playlist += f"{FQDN}/hls/{msg_id}/seg_v_{i}.ts\n"
+    playlist += "#EXT-X-ENDLIST\n"
+
+    return web.Response(text=playlist, content_type="application/vnd.apple.mpegurl", headers={"Access-Control-Allow-Origin": "*"})
+
+# Segmented Audio Playlist
+async def handle_audio_playlist(request):
+    msg_id = int(request.match_info["msg_id"])
+    track_id = int(request.match_info["track_id"])
+    _, duration = await get_audio_tracks_meta(msg_id)
+    seg_duration = 6
+    num_segs = int(math.ceil(duration / seg_duration)) if duration > 0 else 240
+
+    playlist = "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:0\n\n"
+    for i in range(num_segs):
+        playlist += f"#EXTINF:{seg_duration}.0,\n"
+        playlist += f"{FQDN}/hls/{msg_id}/seg_a_{track_id}_{i}.ts\n"
+    playlist += "#EXT-X-ENDLIST\n"
+
+    return web.Response(text=playlist, content_type="application/vnd.apple.mpegurl", headers={"Access-Control-Allow-Origin": "*"})
+
+# Dynamic Segment Delivery using fast Stream Copy (Zero Lag)
+async def handle_segment(request):
+    try:
+        msg_id = int(request.match_info["msg_id"])
+        seg_name = request.match_info["seg_name"]
         source_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
-        seek_time = request.query.get("ss", "0")
 
-        cmd = [
-            "ffmpeg",
-            "-ss", str(seek_time),
-            "-i", source_url,
-            "-map", f"0:a:{track_id}",
-            "-c:a", "aac",
-            "-b:a", "160k",
-            "-f", "adts",
-            "pipe:1"
-        ]
+        # Parse segment requests
+        parts = seg_name.replace(".ts", "").split("_")
+        seg_type = parts[1]
+        
+        if seg_type == "v":
+            seg_index = int(parts[2])
+            start_sec = seg_index * 6
+            # Fast video-only remux (stream copy)
+            cmd = [
+                "ffmpeg", "-ss", str(start_sec), "-t", "6",
+                "-i", source_url,
+                "-map", "0:v:0",
+                "-c:v", "copy",
+                "-f", "mpegts",
+                "pipe:1"
+            ]
+        else:
+            track_id = int(parts[2])
+            seg_index = int(parts[3])
+            start_sec = seg_index * 6
+            # Fast audio-only remux (transcode to clean AAC stream)
+            cmd = [
+                "ffmpeg", "-ss", str(start_sec), "-t", "6",
+                "-i", source_url,
+                "-map", f"0:a:{track_id}",
+                "-c:a", "aac", "-b:a", "160k",
+                "-f", "mpegts",
+                "pipe:1"
+            ]
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "audio/aac",
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "no-cache"
-            }
-        )
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        response = web.StreamResponse(status=200, headers={"Content-Type": "video/MP2T", "Access-Control-Allow-Origin": "*"})
         await response.prepare(request)
 
         while True:
@@ -202,11 +262,11 @@ async def handle_audio_stream(request):
     except Exception as e:
         return web.Response(status=500, text=str(e))
 
-# Route: Web Player
+# Modern Web Player
 async def handle_player(request):
     msg_id = request.match_info["msg_id"]
-    stream_url = f"{FQDN}/watch/{msg_id}"
-    track_info_url = f"{FQDN}/api/tracks/{msg_id}"
+    master_hls_url = f"{FQDN}/hls/{msg_id}/master.m3u8"
+    fallback_direct_url = f"{FQDN}/watch/{msg_id}"
 
     html_content = f"""
     <!DOCTYPE html>
@@ -215,6 +275,7 @@ async def handle_player(request):
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Anime Stream Player</title>
+        <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
         <script src="https://cdn.jsdelivr.net/npm/artplayer/dist/artplayer.js"></script>
         <style>
             * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -251,16 +312,14 @@ async def handle_player(request):
     <body>
         <div class="player-wrapper">
             <div class="artplayer-app"></div>
-            <div class="status-bar" id="status-text">Detecting audio streams...</div>
+            <div class="status-bar" id="status-text">Synchronizing player...</div>
         </div>
 
         <script>
-            let selectedTrack = 0;
-            const extAudio = new Audio();
-
             const art = new Artplayer({{
                 container: '.artplayer-app',
-                url: '{stream_url}',
+                url: '{master_hls_url}',
+                type: 'm3u8',
                 volume: 0.8,
                 isLive: false,
                 autoplay: false,
@@ -272,98 +331,62 @@ async def handle_player(request):
                 fullscreen: true,
                 fullscreenWeb: true,
                 playsInline: true,
-                theme: '#38bdf8'
-            }});
+                theme: '#38bdf8',
+                customType: {{
+                    m3u8: function (video, url, art) {{
+                        if (Hls.isSupported()) {{
+                            const hls = new Hls({{
+                                enableWorker: true,
+                                lowLatencyMode: true,
+                                maxBufferLength: 30
+                            }});
+                            hls.loadSource(url);
+                            hls.attachMedia(video);
+                            art.hls = hls;
 
-            // Synchronize external audio engine with video controls
-            art.on('play', () => {{
-                if (selectedTrack !== 0) extAudio.play();
-            }});
+                            hls.on(Hls.Events.MANIFEST_PARSED, function () {{
+                                document.getElementById('status-text').innerText = `${{hls.audioTracks.length}} Audio Track(s) Active`;
 
-            art.on('pause', () => {{
-                if (selectedTrack !== 0) extAudio.pause();
-            }});
+                                if (hls.audioTracks.length > 0) {{
+                                    const options = hls.audioTracks.map((t, idx) => ({{
+                                        html: t.name || `Track ${{idx + 1}}`,
+                                        value: idx,
+                                        default: idx === hls.audioTrack
+                                    }}));
 
-            art.on('seek', (time) => {{
-                if (selectedTrack !== 0) {{
-                    reloadAudioTrack(time);
-                }}
-            }});
-
-            art.on('video:volumechange', () => {{
-                if (selectedTrack !== 0) {{
-                    extAudio.volume = art.volume;
-                    extAudio.muted = art.muted;
-                }}
-            }});
-
-            // Fetch and display clean audio labels
-            fetch('{track_info_url}')
-                .then(res => res.json())
-                .then(data => {{
-                    const tracks = data.tracks || [];
-                    const statusText = document.getElementById('status-text');
-
-                    if (tracks.length > 0) {{
-                        statusText.innerText = `${{tracks.length}} Audio Track(s) Available`;
-
-                        const selectorList = tracks.map((track, idx) => ({{
-                            html: track.title,
-                            value: track.id,
-                            default: idx === 0
-                        }}));
-
-                        art.setting.add({{
-                            width: 240,
-                            html: 'Audio Track',
-                            tooltip: tracks[0].title,
-                            selector: selectorList,
-                            onSelect: function (item) {{
-                                if (item.value !== selectedTrack) {{
-                                    selectedTrack = item.value;
-                                    handleTrackSwitch(item.value);
+                                    art.setting.add({{
+                                        width: 240,
+                                        html: 'Audio Track',
+                                        tooltip: hls.audioTracks[hls.audioTrack]?.name || 'Audio',
+                                        selector: options,
+                                        onSelect: function (item) {{
+                                            hls.audioTrack = item.value;
+                                            art.notice.show = `Audio: ${{item.html}}`;
+                                            return item.html;
+                                        }}
+                                    }});
                                 }}
-                                return item.html;
-                            }}
-                        }});
-                    }} else {{
-                        statusText.innerText = 'Standard Audio Active';
+                            }});
+
+                            hls.on(Hls.Events.ERROR, function(event, data) {{
+                                if (data.fatal) {{
+                                    console.warn("HLS fatal error, falling back to direct stream");
+                                    video.src = '{fallback_direct_url}';
+                                }}
+                            }});
+                        }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+                            video.src = url;
+                        }}
                     }}
-                }});
-
-            function handleTrackSwitch(trackId) {{
-                if (trackId === 0) {{
-                    // Default audio track: unmute internal video audio
-                    extAudio.pause();
-                    extAudio.src = '';
-                    art.template.$video.muted = false;
-                    art.notice.show = 'Internal audio activated';
-                }} else {{
-                    // Secondary audio track: mute video track and start demuxed stream
-                    art.template.$video.muted = true;
-                    reloadAudioTrack(art.currentTime);
                 }}
-            }}
-
-            function reloadAudioTrack(timeInSeconds) {{
-                const targetTime = Math.floor(timeInSeconds);
-                art.notice.show = 'Switching audio...';
-                
-                extAudio.src = `{FQDN}/audio/{msg_id}/${{selectedTrack}}?ss=${{targetTime}}`;
-                extAudio.volume = art.volume;
-                extAudio.muted = art.muted;
-
-                extAudio.play().then(() => {{
-                    art.notice.show = 'Audio synchronized';
-                }}).catch(() => {{}});
-            }}
+            }});
         </script>
     </body>
     </html>
     """
     return web.Response(text=html_content, content_type="text/html")
 
-# Telegram Command: /start
+# Telegram Handlers
 @bot.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     await message.reply_text(
@@ -372,7 +395,6 @@ async def start_handler(client: Client, message: Message):
         parse_mode=enums.ParseMode.HTML
     )
 
-# Telegram Media Handler
 @bot.on_message(filters.private & (filters.document | filters.video | filters.audio))
 async def auto_forward_and_link(client: Client, message: Message):
     try:
@@ -404,13 +426,16 @@ async def auto_forward_and_link(client: Client, message: Message):
     except Exception as e:
         await message.reply_text(f"Error processing file: {str(e)}")
 
-# Web App Initialization
+# App Init
 async def init_app():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     app.router.add_get("/watch/{msg_id}", handle_stream)
     app.router.add_get("/api/tracks/{msg_id}", handle_track_info)
-    app.router.add_get("/audio/{msg_id}/{track_id}", handle_audio_stream)
+    app.router.add_get("/hls/{msg_id}/master.m3u8", handle_master_playlist)
+    app.router.add_get("/hls/{msg_id}/video.m3u8", handle_video_playlist)
+    app.router.add_get("/hls/{msg_id}/audio_{track_id}.m3u8", handle_audio_playlist)
+    app.router.add_get("/hls/{msg_id}/{seg_name}", handle_segment)
     app.router.add_get("/player/{msg_id}", handle_player)
     return app
 
@@ -425,7 +450,7 @@ if __name__ == "__main__":
         await runner.setup()
         site = web.TCPSite(runner, BIND_ADDRESS, PORT)
         await site.start()
-        print(f"Streaming server live at http://{BIND_ADDRESS}:{PORT}")
+        print(f"Server live at http://{BIND_ADDRESS}:{PORT}")
         await asyncio.Event().wait()
 
     loop.run_until_complete(run())
