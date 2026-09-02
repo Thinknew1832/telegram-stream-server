@@ -2,15 +2,12 @@ import os
 import math
 import sys
 import json
-import re
 import asyncio
-import aiohttp
 from aiohttp import web
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from motor.motor_asyncio import AsyncIOMotorClient
-import PTN
 
+# Configurations
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -18,15 +15,10 @@ BIN_CHANNEL = int(os.getenv("BIN_CHANNEL", "0"))
 PORT = int(os.getenv("PORT", "8080"))
 BIND_ADDRESS = os.getenv("BIND_ADDRESS", "0.0.0.0")
 FQDN = os.getenv("FQDN", f"http://localhost:{PORT}").rstrip("/")
-MONGO_URI = os.getenv("MONGO_URI", "").strip()
 
 if not API_ID or not API_HASH or not BOT_TOKEN or not BIN_CHANNEL:
-    print("\n[CRITICAL ERROR] Missing mandatory environment variables!\n")
+    print("[ERROR] Missing mandatory environment variables.")
     sys.exit(1)
-
-db_client = AsyncIOMotorClient(MONGO_URI) if MONGO_URI else None
-db = db_client["animetoon_db"] if db_client else None
-anime_col = db["anime"] if db is not None else None
 
 bot = Client(
     "StreamBot",
@@ -54,55 +46,10 @@ LANG_MAP = {
 META_CACHE = {}
 DEMUX_LOCK = asyncio.Semaphore(1)
 
-def slugify(text):
-    return re.sub(r'[\W_]+', '-', text.lower()).strip('-')
-
-# Resilient Metadata Fetcher with Fallback Cleansing
-async def fetch_anime_metadata(title):
-    # Strip brackets, tags, file info, and trailing words like "Power" or numbers
-    clean_title = re.sub(r"[\[\(].*?[\]\)]", "", title)
-    clean_title = re.sub(r"(?i)\b(s\d+|e\d+|season|episode|mkv|mp4|480p|720p|1080p|hevc|x264|x265)\b.*", "", clean_title).strip()
-
-    search_queries = [
-        clean_title,
-        clean_title + "s",  # e.g., Power -> Powers
-        " ".join(clean_title.split()[:4])  # First 4 words if title is long
-    ]
-
-    for q in search_queries:
-        if not q or len(q) < 3:
-            continue
-        try:
-            url = f"https://api.jikan.moe/v4/anime?q={aiohttp.helpers.quote(q)}&limit=1"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        results = data.get("data", [])
-                        if results:
-                            item = results[0]
-                            poster = item.get("images", {}).get("jpg", {}).get("large_image_url") or item.get("images", {}).get("webp", {}).get("large_image_url") or ""
-                            banner = item.get("images", {}).get("jpg", {}).get("large_image_url") or poster
-                            return {
-                                "canonical_title": item.get("title_english") or item.get("title"),
-                                "poster": poster,
-                                "banner": banner,
-                                "synopsis": item.get("synopsis") or "A gripping anime story following unique characters on extraordinary journeys.",
-                                "rating": str(item.get("score") or "7.5"),
-                                "genres": ", ".join([g.get("name") for g in item.get("genres", [])]) or "Animation, Adventure",
-                                "year": str(item.get("year") or "2024"),
-                                "status": item.get("status") or "Completed"
-                            }
-        except Exception:
-            pass
-        await asyncio.sleep(0.3)
-
-    return None
-
 async def handle_ping(request):
-    return web.Response(text="Telegram Stream Engine is Online!")
+    return web.Response(text="AnimeToon Stream Engine Online")
 
-# Direct Byte-Range Streaming
+# High-Speed Range Video Stream
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -133,6 +80,7 @@ async def handle_stream(request):
             "Accept-Ranges": "bytes",
             "Content-Length": str(content_length),
             "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Range, Content-Type",
         }
 
         if request.method == "HEAD":
@@ -161,7 +109,7 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# Telegram Native Thumbnail Server for Episode Cards
+# Telegram Native Thumbnail Server
 async def handle_thumbnail(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -171,14 +119,21 @@ async def handle_thumbnail(request):
         if media and hasattr(media, "thumbs") and media.thumbs:
             thumb = media.thumbs[0]
             file_bytes = await bot.download_media(thumb.file_id, in_memory=True)
-            return web.Response(body=file_bytes.getbuffer(), content_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+            return web.Response(
+                body=file_bytes.getbuffer(),
+                content_type="image/jpeg",
+                headers={
+                    "Cache-Control": "public, max-age=604800",
+                    "Access-Control-Allow-Origin": "*"
+                }
+            )
     except Exception:
         pass
-    # Fallback to high-contrast blank SVG if no thumb exists
-    fallback_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90" viewBox="0 0 160 90"><rect width="160" height="90" fill="#2d3748"/><text x="50%" y="50%" fill="#a0aec0" font-family="sans-serif" font-size="12" text-anchor="middle" dy=".3em">Episode</text></svg>'
-    return web.Response(text=fallback_svg, content_type="image/svg+xml")
 
-# Track Info
+    fallback_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90" viewBox="0 0 160 90"><rect width="160" height="90" fill="#1e293b"/><text x="50%" y="50%" fill="#64748b" font-family="sans-serif" font-size="12" text-anchor="middle" dy=".3em">Episode</text></svg>'
+    return web.Response(text=fallback_svg, content_type="image/svg+xml", headers={"Access-Control-Allow-Origin": "*"})
+
+# Track Metadata Inspector
 async def handle_track_info(request):
     msg_id = int(request.match_info["msg_id"])
     if msg_id in META_CACHE:
@@ -221,9 +176,9 @@ async def handle_track_info(request):
         META_CACHE[msg_id] = res
         return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
     except Exception:
-        return web.json_response({"duration": 0, "tracks": []})
+        return web.json_response({"duration": 0, "tracks": []}, headers={"Access-Control-Allow-Origin": "*"})
 
-# Dynamic Remux Endpoint
+# Remux Stream Endpoint for Active Audio Switching
 async def handle_remux_stream(request):
     msg_id = int(request.match_info["msg_id"])
     track_id = int(request.match_info["track_id"])
@@ -244,7 +199,14 @@ async def handle_remux_stream(request):
         "pipe:1"
     ]
 
-    response = web.StreamResponse(status=200, headers={"Content-Type": "video/mp4", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"})
+    response = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "video/mp4",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-cache"
+        }
+    )
     await response.prepare(request)
 
     async with DEMUX_LOCK:
@@ -267,466 +229,35 @@ async def handle_remux_stream(request):
 
     return response
 
-# Web Player Interface
-async def handle_player(request):
-    msg_id = request.match_info["msg_id"]
-    default_stream_url = f"{FQDN}/watch/{msg_id}"
-    track_info_url = f"{FQDN}/api/tracks/{msg_id}"
-
-    html_content = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-        <title>Anime Player</title>
-        <script src="https://cdn.jsdelivr.net/npm/artplayer/dist/artplayer.js"></script>
-        <style>
-            * {{ box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; user-select: none; }}
-            body {{ background-color: #06070a; color: #ffffff; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; overflow-x: hidden; }}
-            .player-container {{ width: 100%; max-width: 1100px; position: relative; }}
-            .artplayer-app {{ width: 100%; aspect-ratio: 16 / 9; border-radius: 10px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.85); background: #000; }}
-            .status-text {{ margin-top: 8px; font-size: 12px; color: #38bdf8; text-align: right; padding-right: 4px; }}
-            .gesture-pill {{ position: absolute; top: 50%; transform: translateY(-50%); padding: 8px 16px; background: rgba(0, 0, 0, 0.75); border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 20px; font-size: 14px; font-weight: 600; color: #fff; opacity: 0; pointer-events: none; transition: opacity 0.2s ease; z-index: 99; }}
-            .gesture-left {{ left: 12%; }}
-            .gesture-right {{ right: 12%; }}
-            .gesture-center {{ left: 50%; transform: translate(-50%, -50%); }}
-        </style>
-    </head>
-    <body>
-        <div class="player-container">
-            <div class="artplayer-app"></div>
-            <div id="seek-back" class="gesture-pill gesture-left">-10s</div>
-            <div id="play-pause-pill" class="gesture-pill gesture-center">Pause</div>
-            <div id="seek-fwd" class="gesture-pill gesture-right">+10s</div>
-            <div class="status-text" id="status-indicator">Connecting engine...</div>
-        </div>
-
-        <script>
-            let currentTrack = 0;
-            let fullVideoDuration = 0;
-            const originalUrl = '{default_stream_url}';
-
-            const art = new Artplayer({{
-                container: '.artplayer-app',
-                url: originalUrl,
-                volume: 0.8,
-                isLive: false,
-                autoplay: false,
-                pip: true,
-                screenshot: true,
-                setting: true,
-                playbackRate: true,
-                aspectRatio: true,
-                fullscreen: true,
-                fullscreenWeb: true,
-                playsInline: true,
-                theme: '#38bdf8'
-            }});
-
-            art.on('video:loadedmetadata', () => {{
-                if (fullVideoDuration > 0) {{
-                    try {{
-                        Object.defineProperty(art.template.$video, 'duration', {{
-                            configurable: true,
-                            get: () => fullVideoDuration
-                        }});
-                    }} catch (e) {{}}
-                }}
-            }});
-
-            fetch('{track_info_url}')
-                .then(res => res.json())
-                .then(data => {{
-                    const tracks = data.tracks || [];
-                    fullVideoDuration = data.duration || 0;
-                    const statusIndicator = document.getElementById('status-indicator');
-
-                    if (tracks.length > 0) {{
-                        statusIndicator.innerText = `${{tracks.length}} Audio Track(s) Ready`;
-
-                        const selectorList = tracks.map((track, idx) => ({{
-                            html: track.title,
-                            value: track.id,
-                            default: idx === 0
-                        }}));
-
-                        art.setting.add({{
-                            width: 250,
-                            html: 'Audio Track',
-                            tooltip: tracks[0].title,
-                            selector: selectorList,
-                            onSelect: function (item) {{
-                                if (item.value !== currentTrack) {{
-                                    currentTrack = item.value;
-                                    switchAudioStream(item.value);
-                                }}
-                                return item.html;
-                            }}
-                        }});
-                    }} else {{
-                        statusIndicator.innerText = 'Audio Ready';
-                    }}
-                }});
-
-            function switchAudioStream(trackId) {{
-                const resumePoint = Math.floor(art.currentTime);
-                art.notice.show = 'Switching audio...';
-
-                if (trackId === 0) {{
-                    art.switchUrl(originalUrl).then(() => {{
-                        art.currentTime = resumePoint;
-                        art.play();
-                    }});
-                }} else {{
-                    const remuxUrl = `{FQDN}/remux/{msg_id}/${{trackId}}?ss=${{resumePoint}}`;
-                    art.switchUrl(remuxUrl).then(() => {{
-                        art.play();
-                    }});
-                }}
-            }}
-
-            art.on('fullscreen', (state) => {{
-                if (state) {{
-                    if (screen.orientation && screen.orientation.lock) {{
-                        screen.orientation.lock('landscape').catch(() => {{}});
-                    }}
-                }} else {{
-                    if (screen.orientation && screen.orientation.unlock) {{
-                        screen.orientation.unlock().catch(() => {{}});
-                    }}
-                }}
-            }});
-
-            let lastTapTime = 0;
-            let lastTapZone = null;
-            const playerBox = document.querySelector('.artplayer-app');
-
-            playerBox.addEventListener('touchend', (e) => {{
-                const now = Date.now();
-                const rect = playerBox.getBoundingClientRect();
-                const x = e.changedTouches[0].clientX - rect.left;
-                const width = rect.width;
-
-                let zone = 'center';
-                if (x < width * 0.35) {{
-                    zone = 'left';
-                }} else if (x > width * 0.65) {{
-                    zone = 'right';
-                }}
-
-                if (now - lastTapTime < 300 && zone === lastTapZone) {{
-                    e.preventDefault();
-
-                    if (zone === 'left') {{
-                        art.currentTime = Math.max(0, art.currentTime - 10);
-                        flashPill('seek-back');
-                    }} else if (zone === 'right') {{
-                        art.currentTime = Math.min(art.duration, art.currentTime + 10);
-                        flashPill('seek-fwd');
-                    }} else {{
-                        if (art.playing) {{
-                            art.pause();
-                            document.getElementById('play-pause-pill').innerText = 'Pause';
-                        }} else {{
-                            art.play();
-                            document.getElementById('play-pause-pill').innerText = 'Play';
-                        }}
-                        flashPill('play-pause-pill');
-                    }}
-
-                    lastTapTime = 0;
-                }} else {{
-                    lastTapTime = now;
-                    lastTapZone = zone;
-                }}
-            }});
-
-            function flashPill(id) {{
-                const el = document.getElementById(id);
-                el.style.opacity = '1';
-                setTimeout(() => {{ el.style.opacity = '0'; }}, 350);
-            }}
-        </script>
-    </body>
-    </html>
-    """
-    return web.Response(text=html_content, content_type="text/html")
-
-# Auto-Indexing Handler
+# Telegram Bot File Helper: Returns msg_id for Excel logging
 @bot.on_message(filters.private & (filters.document | filters.video | filters.audio))
-async def auto_forward_and_index(client: Client, message: Message):
+async def bot_file_handler(client: Client, message: Message):
     try:
         forwarded = await message.forward(chat_id=BIN_CHANNEL)
-
-        file_name = "Unknown Anime"
+        name = "Unknown Episode"
         if message.document and message.document.file_name:
-            file_name = message.document.file_name
+            name = message.document.file_name
         elif message.video and message.video.file_name:
-            file_name = message.video.file_name
-        elif message.caption:
-            file_name = message.caption.split("\n")[0]
-
-        parsed = PTN.parse(file_name)
-        raw_title = parsed.get("title") or file_name.rsplit(".", 1)[0]
-        season_num = parsed.get("season", 1)
-        episode_num = parsed.get("episode", 1)
-
-        if not parsed.get("episode"):
-            ep_match = re.search(r"(?i)[se](\d{1,4})|\b(\d{1,4})\b", file_name)
-            if ep_match:
-                episode_num = int(ep_match.group(1) or ep_match.group(2))
-
-        anime_slug = slugify(raw_title)
-
-        if anime_col is not None:
-            existing = await anime_col.find_one({"_id": anime_slug})
-            if not existing or not existing.get("poster") or "placeholder" in existing.get("poster", ""):
-                meta = await fetch_anime_metadata(raw_title)
-                title = meta["canonical_title"] if meta else raw_title
-                anime_doc = {
-                    "_id": anime_slug,
-                    "title": title,
-                    "poster": meta["poster"] if meta else "https://images.unsplash.com/photo-1578632767115-351597cf2477?w=600",
-                    "banner": meta["banner"] if meta else "https://images.unsplash.com/photo-1578632767115-351597cf2477?w=1200",
-                    "genres": meta["genres"] if meta else "Action, Adventure, Fantasy",
-                    "status": meta["status"] if meta else "Completed",
-                    "description": meta["synopsis"] if meta else "Follow this epic anime adventure as new powers are unleashed.",
-                    "rating": meta["rating"] if meta else "7.8",
-                    "year": meta["year"] if meta else "2024",
-                    "languages": "Multi-Audio",
-                    "episodes": []
-                }
-                await anime_col.update_one({"_id": anime_slug}, {"$set": anime_doc}, upsert=True)
-            else:
-                anime_doc = existing
-
-            ep_entry = {
-                "season": season_num,
-                "ep": episode_num,
-                "title": f"Episode {episode_num}",
-                "msg_id": forwarded.id,
-                "thumb": f"{FQDN}/thumb/{forwarded.id}"
-            }
-
-            await anime_col.update_one(
-                {"_id": anime_slug},
-                {"$pull": {"episodes": {"season": season_num, "ep": episode_num}}}
-            )
-            await anime_col.update_one(
-                {"_id": anime_slug},
-                {"$push": {"episodes": {"$each": [ep_entry], "$sort": {"season": 1, "ep": 1}}}}
-            )
-
-        player_url = f"{FQDN}/player/{forwarded.id}"
-        anime_page_url = f"{FQDN}/anime/{anime_slug}"
+            name = message.video.file_name
 
         reply_text = (
-            f"<b>Episode Auto-Indexed!</b>\n\n"
-            f"<b>Anime:</b> <code>{raw_title}</code>\n"
-            f"<b>Episode:</b> Season {season_num} Episode {episode_num}\n"
-            f"<b>Web Player:</b> <code>{player_url}</code>\n"
-            f"<b>Anime Page:</b> <code>{anime_page_url}</code>"
+            f"<b>File Processed for Excel Entry</b>\n\n"
+            f"<b>File Name:</b> <code>{name}</code>\n"
+            f"<b>Message ID (msg_id):</b> <code>{forwarded.id}</code>\n"
+            f"<b>Direct Stream:</b> <code>{FQDN}/watch/{forwarded.id}</code>\n\n"
+            f"<i>Copy this msg_id into your Google Sheets/Excel table.</i>"
         )
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Watch Episode", url=player_url)],
-            [InlineKeyboardButton("View Anime Series", url=anime_page_url)]
-        ])
-
-        await message.reply_text(reply_text, parse_mode=enums.ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
+        await message.reply_text(reply_text, parse_mode=enums.ParseMode.HTML)
     except Exception as e:
-        await message.reply_text(f"Auto-index failed: {str(e)}")
+        await message.reply_text(f"Processing error: {str(e)}")
 
-# Home Page with Referrer Header Bypass
-async def handle_home(request):
-    if anime_col is None:
-        return web.Response(text="Database initializing...", content_type="text/html")
-
-    anime_list = await anime_col.find().sort("year", -1).to_list(length=100)
-    if not anime_list:
-        return web.Response(text="<div style='font-family:sans-serif;padding:30px;text-align:center;'><h2>AnimeToon is Live!</h2><p>Forward your anime files to your Telegram bot to index.</p></div>", content_type="text/html")
-
-    hero = anime_list[0]
-    cards_html = ""
-    for item in anime_list:
-        cards_html += f"""
-        <a href="/anime/{item['_id']}" class="anime-card">
-            <div class="poster-box">
-                <img src="{item.get('poster')}" alt="{item.get('title')}" referrerpolicy="no-referrer" loading="lazy" />
-                <span class="rating-badge">★ {item.get('rating', '7.0')}</span>
-                <span class="multi-badge">Multi</span>
-            </div>
-            <h3 class="card-title">{item.get('title')}</h3>
-            <div class="card-meta">
-                <span>{item.get('year', '2024')}</span>
-                <span class="type-pill">TV</span>
-            </div>
-        </a>
-        """
-
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <meta name="referrer" content="no-referrer">
-        <title>AnimeToon</title>
-        <style>
-            * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; text-decoration: none; }}
-            body {{ background-color: #ffffff; color: #111; padding-bottom: 40px; }}
-            header {{ display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; }}
-            .brand {{ font-size: 24px; font-weight: 800; color: #ff2a74; }}
-            .hero-container {{ margin: 10px 16px; position: relative; border-radius: 18px; overflow: hidden; box-shadow: 0 10px 25px rgba(0,0,0,0.12); }}
-            .hero-img {{ width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; }}
-            .hero-overlay {{ position: absolute; inset: 0; background: linear-gradient(180deg, transparent 40%, rgba(0,0,0,0.85) 100%); display: flex; flex-direction: column; justify-content: flex-end; padding: 16px; }}
-            .hero-title {{ color: #fff; font-size: 20px; font-weight: 700; margin-bottom: 10px; }}
-            .watch-btn {{ background: #ff2a74; color: #fff; padding: 8px 18px; border-radius: 20px; font-size: 14px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; width: fit-content; }}
-            .section-header {{ display: flex; justify-content: space-between; align-items: center; padding: 22px 18px 12px; }}
-            .section-title {{ font-size: 17px; font-weight: 800; text-transform: uppercase; border-left: 4px solid #ff2a74; padding-left: 8px; }}
-            .anime-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; padding: 0 16px; }}
-            .anime-card {{ display: flex; flex-direction: column; }}
-            .poster-box {{ position: relative; border-radius: 14px; overflow: hidden; aspect-ratio: 1/1.4; background: #e2e8f0; }}
-            .poster-box img {{ width: 100%; height: 100%; object-fit: cover; }}
-            .rating-badge {{ position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.7); color: #ffd700; font-size: 11px; padding: 3px 6px; border-radius: 6px; font-weight: 700; }}
-            .multi-badge {{ position: absolute; bottom: 8px; right: 8px; background: #ff2a74; color: #fff; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 8px; }}
-            .card-title {{ font-size: 14px; font-weight: 700; color: #111; margin-top: 8px; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }}
-            .card-meta {{ display: flex; justify-content: space-between; align-items: center; margin-top: 4px; font-size: 12px; color: #666; }}
-            .type-pill {{ background: #f0f2f5; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; }}
-        </style>
-    </head>
-    <body>
-        <header>
-            <div class="brand">AnimeToon</div>
-        </header>
-
-        <div class="hero-container">
-            <img src="{hero.get('banner')}" class="hero-img" alt="{hero.get('title')}" referrerpolicy="no-referrer" />
-            <div class="hero-overlay">
-                <div class="hero-title">{hero.get('title')}</div>
-                <a href="/anime/{hero['_id']}" class="watch-btn">▶ Watch Now</a>
-            </div>
-        </div>
-
-        <div class="section-header">
-            <div class="section-title">Recently Added</div>
-        </div>
-
-        <div class="anime-grid">
-            {cards_html}
-        </div>
-    </body>
-    </html>
-    """
-    return web.Response(text=html, content_type="text/html")
-
-# Anime Details with Real Thumbnails & No-Referrer Images
-async def handle_anime_detail(request):
-    if anime_col is None:
-        return web.Response(status=500, text="Database Unavailable")
-
-    anime_id = request.match_info["anime_id"]
-    anime = await anime_col.find_one({"_id": anime_id})
-
-    if not anime:
-        return web.Response(status=404, text="Anime Not Found")
-
-    # If description or images were missed on initial upload, auto-repair now
-    if not anime.get("description") or anime.get("description") == "No description available.":
-        re_meta = await fetch_anime_metadata(anime["title"])
-        if re_meta:
-            await anime_col.update_one({"_id": anime_id}, {"$set": re_meta})
-            anime.update(re_meta)
-
-    episodes = anime.get("episodes", [])
-    episodes_html = ""
-    for ep in episodes:
-        thumb_src = ep.get("thumb") or f"{FQDN}/thumb/{ep['msg_id']}"
-        episodes_html += f"""
-        <a href="/player/{ep['msg_id']}" class="ep-card">
-            <div class="ep-thumb">
-                <img src="{thumb_src}" alt="Ep {ep['ep']}" referrerpolicy="no-referrer" />
-            </div>
-            <div class="ep-details">
-                <span class="ep-num">S{ep.get('season', 1):02d} E{ep['ep']:02d}</span>
-                <span class="ep-name">{ep.get('title', f"Episode {ep['ep']}")}</span>
-            </div>
-            <div class="ep-play-btn">▶</div>
-        </a>
-        """
-
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <meta name="referrer" content="no-referrer">
-        <title>{anime['title']} - AnimeToon</title>
-        <style>
-            * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; text-decoration: none; }}
-            body {{ background-color: #f7f9fc; color: #111; padding-bottom: 40px; }}
-            header {{ display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; background: #fff; }}
-            .brand {{ font-size: 24px; font-weight: 800; color: #ff2a74; }}
-            .banner-box {{ margin: 12px 16px; border-radius: 18px; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,0.12); background: #e2e8f0; }}
-            .banner-box img {{ width: 100%; aspect-ratio: 16/10; object-fit: cover; display: block; }}
-            .meta-section {{ padding: 0 18px; margin-top: 12px; }}
-            .genres {{ font-size: 12px; font-weight: 600; color: #ff2a74; }}
-            .title {{ font-size: 20px; font-weight: 800; margin: 6px 0; }}
-            .desc {{ font-size: 13px; color: #444; line-height: 1.45; margin: 8px 0; }}
-            .specs {{ display: flex; align-items: center; gap: 10px; font-size: 13px; color: #333; font-weight: 600; }}
-            .season-dropdown {{ margin: 18px 16px 12px; padding: 10px 14px; background: #eef2f6; border-radius: 10px; font-weight: 700; font-size: 14px; }}
-            .episodes-list {{ display: flex; flex-direction: column; gap: 12px; padding: 0 16px; }}
-            .ep-card {{ display: flex; align-items: center; background: #ffffff; padding: 10px 14px; border-radius: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); border: 1px solid #edf0f5; }}
-            .ep-thumb {{ width: 110px; height: 65px; border-radius: 10px; overflow: hidden; flex-shrink: 0; background: #e2e8f0; }}
-            .ep-thumb img {{ width: 100%; height: 100%; object-fit: cover; }}
-            .ep-details {{ margin-left: 14px; flex-grow: 1; }}
-            .ep-num {{ font-size: 11px; font-weight: 700; color: #666; text-transform: uppercase; }}
-            .ep-name {{ font-size: 13px; font-weight: 700; color: #111; margin-top: 2px; }}
-            .ep-play-btn {{ color: #ff2a74; font-size: 14px; margin-left: 8px; }}
-        </style>
-    </head>
-    <body>
-        <header>
-            <a href="/" class="brand">AnimeToon</a>
-        </header>
-
-        <div class="banner-box">
-            <img src="{anime.get('banner')}" alt="{anime['title']}" referrerpolicy="no-referrer" />
-        </div>
-
-        <div class="meta-section">
-            <div class="genres">{anime.get('genres', 'Animation, Action')}</div>
-            <h1 class="title">{anime['title']}</h1>
-            <p class="desc">{anime.get('description', 'Follow this epic journey with high-octane action and magical encounters.')}</p>
-            <div class="specs">
-                <span>★ {anime.get('rating', '7.5')}</span>
-                <span>•</span>
-                <span>{len(episodes)} Episodes</span>
-            </div>
-        </div>
-
-        <div class="season-dropdown">EPISODES</div>
-
-        <div class="episodes-list">
-            {episodes_html if episodes_html else "<p style='padding:16px;'>No episodes added yet.</p>"}
-        </div>
-    </body>
-    </html>
-    """
-    return web.Response(text=html, content_type="text/html")
-
-# App Initialization
 async def init_app():
     app = web.Application()
-    app.router.add_get("/", handle_home)
-    app.router.add_get("/anime/{anime_id}", handle_anime_detail)
-    app.router.add_get("/thumb/{msg_id}", handle_thumbnail)
+    app.router.add_get("/", handle_ping)
     app.router.add_get("/watch/{msg_id}", handle_stream)
+    app.router.add_get("/thumb/{msg_id}", handle_thumbnail)
     app.router.add_get("/api/tracks/{msg_id}", handle_track_info)
     app.router.add_get("/remux/{msg_id}/{track_id}", handle_remux_stream)
-    app.router.add_get("/player/{msg_id}", handle_player)
     return app
 
 if __name__ == "__main__":
@@ -739,7 +270,7 @@ if __name__ == "__main__":
         await runner.setup()
         site = web.TCPSite(runner, BIND_ADDRESS, PORT)
         await site.start()
-        print(f"AnimeToon server live at http://{BIND_ADDRESS}:{PORT}")
+        print(f"Render engine listening on port {PORT}")
         await asyncio.Event().wait()
 
     loop.run_until_complete(run())
