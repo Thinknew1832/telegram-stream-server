@@ -1,4 +1,6 @@
-pyrogram>=2.0.106
-TgCrypto>=1.2.5
-aiohttp>=3.9.0
-python-dotenv>=1.0.0
+aiohttp
+pyrogram
+tgcrypto
+motor
+parse-torrent-title
+
