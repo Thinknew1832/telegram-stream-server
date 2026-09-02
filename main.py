@@ -43,10 +43,13 @@ LANG_MAP = {
     "und": "Default"
 }
 
+# Strict single-process lock to stay within Render 512MB RAM
+DEMUX_LOCK = asyncio.Semaphore(1)
+
 async def handle_ping(request):
     return web.Response(text="Telegram Stream Engine is Online!")
 
-# Direct Telegram Byte Stream
+# 1. Native Byte Stream (Used internally as input to FFmpeg & direct fallback)
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -69,7 +72,7 @@ async def handle_stream(request):
             to_byte = file_size - 1
 
         content_length = to_byte - from_byte + 1
-        chunk_size = 1024 * 1024
+        chunk_size = 512 * 1024
 
         headers = {
             "Content-Type": mime_type,
@@ -85,12 +88,12 @@ async def handle_stream(request):
         response = web.StreamResponse(status=206 if range_header else 200, headers=headers)
         await response.prepare(request)
 
-        offset = int(math.floor(from_byte / chunk_size))
+        offset = int(math.floor(from_byte / (1024 * 1024)))
         bytes_sent = 0
 
         async for chunk in bot.stream_media(msg, offset=offset):
-            if bytes_sent == 0 and (from_byte % chunk_size) != 0:
-                chunk = chunk[(from_byte % chunk_size):]
+            if bytes_sent == 0 and (from_byte % (1024 * 1024)) != 0:
+                chunk = chunk[(from_byte % (1024 * 1024)):]
 
             if bytes_sent + len(chunk) > content_length:
                 chunk = chunk[:content_length - bytes_sent]
@@ -105,168 +108,121 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# Inspect Audio Streams
-async def get_audio_tracks_meta(msg_id):
-    source_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-probesize", "5000000",
-        "-analyzeduration", "2000000",
-        "-show_entries", "stream=index,codec_name,codec_type:stream_tags=language,title:format=duration",
-        "-of", "json",
-        source_url
-    ]
-    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    stdout, _ = await process.communicate()
-    data = json.loads(stdout.decode())
-    
-    duration = float(data.get("format", {}).get("duration", 0))
-    tracks = []
-    audio_idx = 0
-    for stream in data.get("streams", []):
-        if stream.get("codec_type") == "audio":
-            tags = stream.get("tags", {})
-            raw_lang = tags.get("language", "und").lower()
-            clean_lang = LANG_MAP.get(raw_lang, raw_lang.capitalize())
-            title = tags.get("title", "")
-            if "@" in title or not title:
-                name = f"{clean_lang}"
-            else:
-                name = f"{title} ({clean_lang})"
-            tracks.append({"id": audio_idx, "name": name, "lang": raw_lang})
-            audio_idx += 1
-    return tracks, duration
-
-# API to fetch tracks list
+# 2. Probe Track Metadata (Returns track titles & duration)
 async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
-        tracks, _ = await get_audio_tracks_meta(msg_id)
-        return web.json_response({"tracks": tracks}, headers={"Access-Control-Allow-Origin": "*"})
-    except Exception:
-        return web.json_response({"tracks": []})
-
-# HLS Master Playlist (Standard Multi-Audio spec)
-async def handle_master_playlist(request):
-    try:
-        msg_id = int(request.match_info["msg_id"])
-        tracks, _ = await get_audio_tracks_meta(msg_id)
-
-        playlist = "#EXTM3U\n#EXT-X-VERSION:4\n\n"
-
-        for track in tracks:
-            t_id = track["id"]
-            name = track["name"]
-            lang = track["lang"]
-            is_default = "YES" if t_id == 0 else "NO"
-            playlist += (
-                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-group",NAME="{name}",'
-                f'DEFAULT={is_default},AUTOSELECT=YES,LANGUAGE="{lang}",'
-                f'URI="{FQDN}/hls/{msg_id}/audio_{t_id}.m3u8"\n'
-            )
-
-        playlist += (
-            f'\n#EXT-X-STREAM-INF:BANDWIDTH=3500000,AUDIO="audio-group"\n'
-            f'{FQDN}/hls/{msg_id}/video.m3u8\n'
-        )
-
-        return web.Response(
-            text=playlist,
-            content_type="application/vnd.apple.mpegurl",
-            headers={"Access-Control-Allow-Origin": "*"}
-        )
-    except Exception as e:
-        return web.Response(status=500, text=str(e))
-
-# Segmented Video Playlist
-async def handle_video_playlist(request):
-    msg_id = int(request.match_info["msg_id"])
-    _, duration = await get_audio_tracks_meta(msg_id)
-    seg_duration = 6
-    num_segs = int(math.ceil(duration / seg_duration)) if duration > 0 else 240
-
-    playlist = "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:0\n\n"
-    for i in range(num_segs):
-        playlist += f"#EXTINF:{seg_duration}.0,\n"
-        playlist += f"{FQDN}/hls/{msg_id}/seg_v_{i}.ts\n"
-    playlist += "#EXT-X-ENDLIST\n"
-
-    return web.Response(text=playlist, content_type="application/vnd.apple.mpegurl", headers={"Access-Control-Allow-Origin": "*"})
-
-# Segmented Audio Playlist
-async def handle_audio_playlist(request):
-    msg_id = int(request.match_info["msg_id"])
-    track_id = int(request.match_info["track_id"])
-    _, duration = await get_audio_tracks_meta(msg_id)
-    seg_duration = 6
-    num_segs = int(math.ceil(duration / seg_duration)) if duration > 0 else 240
-
-    playlist = "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:0\n\n"
-    for i in range(num_segs):
-        playlist += f"#EXTINF:{seg_duration}.0,\n"
-        playlist += f"{FQDN}/hls/{msg_id}/seg_a_{track_id}_{i}.ts\n"
-    playlist += "#EXT-X-ENDLIST\n"
-
-    return web.Response(text=playlist, content_type="application/vnd.apple.mpegurl", headers={"Access-Control-Allow-Origin": "*"})
-
-# Dynamic Segment Delivery using fast Stream Copy (Zero Lag)
-async def handle_segment(request):
-    try:
-        msg_id = int(request.match_info["msg_id"])
-        seg_name = request.match_info["seg_name"]
         source_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
 
-        # Parse segment requests
-        parts = seg_name.replace(".ts", "").split("_")
-        seg_type = parts[1]
-        
-        if seg_type == "v":
-            seg_index = int(parts[2])
-            start_sec = seg_index * 6
-            # Fast video-only remux (stream copy)
-            cmd = [
-                "ffmpeg", "-ss", str(start_sec), "-t", "6",
-                "-i", source_url,
-                "-map", "0:v:0",
-                "-c:v", "copy",
-                "-f", "mpegts",
-                "pipe:1"
-            ]
-        else:
-            track_id = int(parts[2])
-            seg_index = int(parts[3])
-            start_sec = seg_index * 6
-            # Fast audio-only remux (transcode to clean AAC stream)
-            cmd = [
-                "ffmpeg", "-ss", str(start_sec), "-t", "6",
-                "-i", source_url,
-                "-map", f"0:a:{track_id}",
-                "-c:a", "aac", "-b:a", "160k",
-                "-f", "mpegts",
-                "pipe:1"
-            ]
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-probesize", "4000000",
+            "-analyzeduration", "2000000",
+            "-show_entries", "stream=index,codec_name,codec_type:stream_tags=language,title:format=duration",
+            "-of", "json",
+            source_url
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        data = json.loads(stdout.decode())
 
-        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        response = web.StreamResponse(status=200, headers={"Content-Type": "video/MP2T", "Access-Control-Allow-Origin": "*"})
-        await response.prepare(request)
+        duration = float(data.get("format", {}).get("duration", 0))
+        tracks = []
+        audio_idx = 0
 
-        while True:
-            chunk = await process.stdout.read(64 * 1024)
-            if not chunk:
-                break
-            await response.write(chunk)
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "audio":
+                tags = stream.get("tags", {})
+                raw_lang = tags.get("language", "und").lower()
+                clean_lang = LANG_MAP.get(raw_lang, raw_lang.capitalize())
+                title = tags.get("title", "")
+                
+                # Replace spam/watermark titles with real language label
+                if "@" in title or not title:
+                    title = f"Track {audio_idx + 1}: {clean_lang}"
+                else:
+                    title = f"{title} [{clean_lang}]"
 
-        await process.wait()
-        return response
+                tracks.append({
+                    "id": audio_idx,
+                    "title": title
+                })
+                audio_idx += 1
+
+        return web.json_response({
+            "duration": duration,
+            "tracks": tracks
+        }, headers={"Access-Control-Allow-Origin": "*"})
     except Exception as e:
-        return web.Response(status=500, text=str(e))
+        return web.json_response({"duration": 0, "tracks": []})
 
-# Modern Web Player
+# 3. True Server-Side Demuxer (Stream-copies video + isolates selected audio track)
+async def handle_demux_stream(request):
+    msg_id = int(request.match_info["msg_id"])
+    track_id = int(request.match_info["track_id"])
+    seek_time = request.query.get("ss", "0")
+    source_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
+
+    # Fast seek on HTTP source, map video stream 0 and chosen audio track
+    cmd = [
+        "ffmpeg",
+        "-ss", str(seek_time),
+        "-i", source_url,
+        "-map", "0:v:0",
+        "-map", f"0:a:{track_id}",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "160k",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "-f", "mp4",
+        "pipe:1"
+    ]
+
+    response = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "video/mp4",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-cache"
+        }
+    )
+    await response.prepare(request)
+
+    async with DEMUX_LOCK:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+
+        try:
+            while True:
+                chunk = await process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                await response.write(chunk)
+        except (asyncio.CancelledError, ConnectionResetError):
+            pass
+        finally:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                    await process.wait()
+                except Exception:
+                    pass
+
+    return response
+
+# 4. Web Player Interface with Seamless Track Switching
 async def handle_player(request):
     msg_id = request.match_info["msg_id"]
-    master_hls_url = f"{FQDN}/hls/{msg_id}/master.m3u8"
-    fallback_direct_url = f"{FQDN}/watch/{msg_id}"
+    default_stream_url = f"{FQDN}/watch/{msg_id}"
+    track_info_url = f"{FQDN}/api/tracks/{msg_id}"
 
     html_content = f"""
     <!DOCTYPE html>
@@ -274,13 +230,12 @@ async def handle_player(request):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Anime Stream Player</title>
-        <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+        <title>Anime Player - Server Demuxer</title>
         <script src="https://cdn.jsdelivr.net/npm/artplayer/dist/artplayer.js"></script>
         <style>
             * {{ box-sizing: border-box; margin: 0; padding: 0; }}
             body {{
-                background-color: #080a10;
+                background-color: #090b10;
                 color: #ffffff;
                 display: flex;
                 flex-direction: column;
@@ -312,14 +267,18 @@ async def handle_player(request):
     <body>
         <div class="player-wrapper">
             <div class="artplayer-app"></div>
-            <div class="status-bar" id="status-text">Synchronizing player...</div>
+            <div class="status-bar" id="status-text">Connecting demuxer engine...</div>
         </div>
 
         <script>
+            let currentTrack = 0;
+            let currentSeekOffset = 0;
+            let fullDuration = 0;
+            const originalUrl = '{default_stream_url}';
+
             const art = new Artplayer({{
                 container: '.artplayer-app',
-                url: '{master_hls_url}',
-                type: 'm3u8',
+                url: originalUrl,
                 volume: 0.8,
                 isLive: false,
                 autoplay: false,
@@ -331,62 +290,78 @@ async def handle_player(request):
                 fullscreen: true,
                 fullscreenWeb: true,
                 playsInline: true,
-                theme: '#38bdf8',
-                customType: {{
-                    m3u8: function (video, url, art) {{
-                        if (Hls.isSupported()) {{
-                            const hls = new Hls({{
-                                enableWorker: true,
-                                lowLatencyMode: true,
-                                maxBufferLength: 30
-                            }});
-                            hls.loadSource(url);
-                            hls.attachMedia(video);
-                            art.hls = hls;
+                theme: '#38bdf8'
+            }});
 
-                            hls.on(Hls.Events.MANIFEST_PARSED, function () {{
-                                document.getElementById('status-text').innerText = `${{hls.audioTracks.length}} Audio Track(s) Active`;
-
-                                if (hls.audioTracks.length > 0) {{
-                                    const options = hls.audioTracks.map((t, idx) => ({{
-                                        html: t.name || `Track ${{idx + 1}}`,
-                                        value: idx,
-                                        default: idx === hls.audioTrack
-                                    }}));
-
-                                    art.setting.add({{
-                                        width: 240,
-                                        html: 'Audio Track',
-                                        tooltip: hls.audioTracks[hls.audioTrack]?.name || 'Audio',
-                                        selector: options,
-                                        onSelect: function (item) {{
-                                            hls.audioTrack = item.value;
-                                            art.notice.show = `Audio: ${{item.html}}`;
-                                            return item.html;
-                                        }}
-                                    }});
-                                }}
-                            }});
-
-                            hls.on(Hls.Events.ERROR, function(event, data) {{
-                                if (data.fatal) {{
-                                    console.warn("HLS fatal error, falling back to direct stream");
-                                    video.src = '{fallback_direct_url}';
-                                }}
-                            }});
-                        }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-                            video.src = url;
-                        }}
-                    }}
+            // Preserve and fix duration display across stream hops
+            art.on('video:loadedmetadata', () => {{
+                if (fullDuration > 0 && art.duration < fullDuration) {{
+                    Object.defineProperty(art.template.$video, 'duration', {{
+                        configurable: true,
+                        get: () => fullDuration
+                    }});
                 }}
             }});
+
+            fetch('{track_info_url}')
+                .then(res => res.json())
+                .then(data => {{
+                    const tracks = data.tracks || [];
+                    fullDuration = data.duration || 0;
+                    const statusText = document.getElementById('status-text');
+
+                    if (tracks.length > 0) {{
+                        statusText.innerText = `${{tracks.length}} Audio Track(s) Ready`;
+
+                        const selectorList = tracks.map((track, idx) => ({{
+                            html: track.title,
+                            value: track.id,
+                            default: idx === 0
+                        }}));
+
+                        art.setting.add({{
+                            width: 260,
+                            html: 'Audio Track',
+                            tooltip: tracks[0].title,
+                            selector: selectorList,
+                            onSelect: function (item) {{
+                                if (item.value !== currentTrack) {{
+                                    currentTrack = item.value;
+                                    switchAudioServer(item.value);
+                                }}
+                                return item.html;
+                            }}
+                        }});
+                    }} else {{
+                        statusText.innerText = 'Single Audio Stream';
+                    }}
+                }});
+
+            function switchAudioServer(trackId) {{
+                const currentTime = Math.floor(art.currentTime);
+                art.notice.show = 'Demuxing audio track...';
+
+                if (trackId === 0) {{
+                    art.switchUrl(originalUrl).then(() => {{
+                        art.currentTime = currentTime;
+                        art.play();
+                        art.notice.show = 'Switched to Track 1';
+                    }});
+                }} else {{
+                    const demuxUrl = `{FQDN}/demux/{msg_id}/${{trackId}}?ss=${{currentTime}}`;
+                    art.switchUrl(demuxUrl).then(() => {{
+                        art.play();
+                        art.notice.show = `Track ${{trackId + 1}} Active`;
+                    }});
+                }}
+            }}
         </script>
     </body>
     </html>
     """
     return web.Response(text=html_content, content_type="text/html")
 
-# Telegram Handlers
+# Telegram Bot Handlers
 @bot.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     await message.reply_text(
@@ -426,21 +401,17 @@ async def auto_forward_and_link(client: Client, message: Message):
     except Exception as e:
         await message.reply_text(f"Error processing file: {str(e)}")
 
-# App Init
+# Web App Initialization
 async def init_app():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     app.router.add_get("/watch/{msg_id}", handle_stream)
     app.router.add_get("/api/tracks/{msg_id}", handle_track_info)
-    app.router.add_get("/hls/{msg_id}/master.m3u8", handle_master_playlist)
-    app.router.add_get("/hls/{msg_id}/video.m3u8", handle_video_playlist)
-    app.router.add_get("/hls/{msg_id}/audio_{track_id}.m3u8", handle_audio_playlist)
-    app.router.add_get("/hls/{msg_id}/{seg_name}", handle_segment)
+    app.router.add_get("/demux/{msg_id}/{track_id}", handle_demux_stream)
     app.router.add_get("/player/{msg_id}", handle_player)
     return app
 
 if __name__ == "__main__":
-    import asyncio
     loop = asyncio.get_event_loop()
 
     async def run():
