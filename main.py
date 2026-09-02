@@ -11,7 +11,6 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from motor.motor_asyncio import AsyncIOMotorClient
 import PTN
 
-# Environment Configurations
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -25,7 +24,6 @@ if not API_ID or not API_HASH or not BOT_TOKEN or not BIN_CHANNEL:
     print("\n[CRITICAL ERROR] Missing mandatory environment variables!\n")
     sys.exit(1)
 
-# Database Setup
 db_client = AsyncIOMotorClient(MONGO_URI) if MONGO_URI else None
 db = db_client["animetoon_db"] if db_client else None
 anime_col = db["anime"] if db is not None else None
@@ -59,36 +57,52 @@ DEMUX_LOCK = asyncio.Semaphore(1)
 def slugify(text):
     return re.sub(r'[\W_]+', '-', text.lower()).strip('-')
 
-# Fetch Anime Metadata from Jikan API (MyAnimeList free database)
+# Resilient Metadata Fetcher with Fallback Cleansing
 async def fetch_anime_metadata(title):
-    try:
-        clean_title = re.sub(r"[\[\(].*?[\]\)]", "", title).strip()
-        url = f"https://api.jikan.moe/v4/anime?q={clean_title}&limit=1"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    results = data.get("data", [])
-                    if results:
-                        item = results[0]
-                        return {
-                            "canonical_title": item.get("title_english") or item.get("title"),
-                            "poster": item.get("images", {}).get("webp", {}).get("large_image_url") or "",
-                            "banner": item.get("images", {}).get("jpg", {}).get("large_image_url") or "",
-                            "synopsis": item.get("synopsis") or "No synopsis available.",
-                            "rating": str(item.get("score") or "7.5"),
-                            "genres": ", ".join([g.get("name") for g in item.get("genres", [])]),
-                            "year": str(item.get("year") or "2024"),
-                            "status": item.get("status") or "Ongoing"
-                        }
-    except Exception as e:
-        print(f"Metadata fetch error: {e}")
+    # Strip brackets, tags, file info, and trailing words like "Power" or numbers
+    clean_title = re.sub(r"[\[\(].*?[\]\)]", "", title)
+    clean_title = re.sub(r"(?i)\b(s\d+|e\d+|season|episode|mkv|mp4|480p|720p|1080p|hevc|x264|x265)\b.*", "", clean_title).strip()
+
+    search_queries = [
+        clean_title,
+        clean_title + "s",  # e.g., Power -> Powers
+        " ".join(clean_title.split()[:4])  # First 4 words if title is long
+    ]
+
+    for q in search_queries:
+        if not q or len(q) < 3:
+            continue
+        try:
+            url = f"https://api.jikan.moe/v4/anime?q={aiohttp.helpers.quote(q)}&limit=1"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        results = data.get("data", [])
+                        if results:
+                            item = results[0]
+                            poster = item.get("images", {}).get("jpg", {}).get("large_image_url") or item.get("images", {}).get("webp", {}).get("large_image_url") or ""
+                            banner = item.get("images", {}).get("jpg", {}).get("large_image_url") or poster
+                            return {
+                                "canonical_title": item.get("title_english") or item.get("title"),
+                                "poster": poster,
+                                "banner": banner,
+                                "synopsis": item.get("synopsis") or "A gripping anime story following unique characters on extraordinary journeys.",
+                                "rating": str(item.get("score") or "7.5"),
+                                "genres": ", ".join([g.get("name") for g in item.get("genres", [])]) or "Animation, Adventure",
+                                "year": str(item.get("year") or "2024"),
+                                "status": item.get("status") or "Completed"
+                            }
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+
     return None
 
 async def handle_ping(request):
     return web.Response(text="Telegram Stream Engine is Online!")
 
-# Direct High-Speed Byte-Range Streaming
+# Direct Byte-Range Streaming
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -147,7 +161,24 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# Track Metadata Inspector
+# Telegram Native Thumbnail Server for Episode Cards
+async def handle_thumbnail(request):
+    try:
+        msg_id = int(request.match_info["msg_id"])
+        msg: Message = await bot.get_messages(BIN_CHANNEL, msg_id)
+        media = msg.video or msg.document
+
+        if media and hasattr(media, "thumbs") and media.thumbs:
+            thumb = media.thumbs[0]
+            file_bytes = await bot.download_media(thumb.file_id, in_memory=True)
+            return web.Response(body=file_bytes.getbuffer(), content_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+    except Exception:
+        pass
+    # Fallback to high-contrast blank SVG if no thumb exists
+    fallback_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90" viewBox="0 0 160 90"><rect width="160" height="90" fill="#2d3748"/><text x="50%" y="50%" fill="#a0aec0" font-family="sans-serif" font-size="12" text-anchor="middle" dy=".3em">Episode</text></svg>'
+    return web.Response(text=fallback_svg, content_type="image/svg+xml")
+
+# Track Info
 async def handle_track_info(request):
     msg_id = int(request.match_info["msg_id"])
     if msg_id in META_CACHE:
@@ -178,7 +209,6 @@ async def handle_track_info(request):
                 raw_lang = tags.get("language", "und").lower()
                 clean_lang = LANG_MAP.get(raw_lang, raw_lang.capitalize())
                 title = tags.get("title", "")
-
                 if "@" in title or not title:
                     title = f"Track {audio_idx + 1}: {clean_lang}"
                 else:
@@ -214,14 +244,7 @@ async def handle_remux_stream(request):
         "pipe:1"
     ]
 
-    response = web.StreamResponse(
-        status=200,
-        headers={
-            "Content-Type": "video/mp4",
-            "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "no-cache"
-        }
-    )
+    response = web.StreamResponse(status=200, headers={"Content-Type": "video/mp4", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"})
     await response.prepare(request)
 
     async with DEMUX_LOCK:
@@ -430,7 +453,7 @@ async def handle_player(request):
     """
     return web.Response(text=html_content, content_type="text/html")
 
-# Auto-Indexing Handler (Telegram Trigger)
+# Auto-Indexing Handler
 @bot.on_message(filters.private & (filters.document | filters.video | filters.audio))
 async def auto_forward_and_index(client: Client, message: Message):
     try:
@@ -450,7 +473,7 @@ async def auto_forward_and_index(client: Client, message: Message):
         episode_num = parsed.get("episode", 1)
 
         if not parsed.get("episode"):
-            ep_match = re.search(r"[Ee](\d{1,4})|\b(\d{1,4})\b", file_name)
+            ep_match = re.search(r"(?i)[se](\d{1,4})|\b(\d{1,4})\b", file_name)
             if ep_match:
                 episode_num = int(ep_match.group(1) or ep_match.group(2))
 
@@ -458,23 +481,23 @@ async def auto_forward_and_index(client: Client, message: Message):
 
         if anime_col is not None:
             existing = await anime_col.find_one({"_id": anime_slug})
-            if not existing:
+            if not existing or not existing.get("poster") or "placeholder" in existing.get("poster", ""):
                 meta = await fetch_anime_metadata(raw_title)
                 title = meta["canonical_title"] if meta else raw_title
                 anime_doc = {
                     "_id": anime_slug,
                     "title": title,
-                    "poster": meta["poster"] if meta else "https://via.placeholder.com/300x450",
-                    "banner": meta["banner"] if meta else "https://via.placeholder.com/1280x720",
-                    "genres": meta["genres"] if meta else "Anime",
-                    "status": meta["status"] if meta else "Ongoing",
-                    "description": meta["synopsis"] if meta else "No description available.",
-                    "rating": meta["rating"] if meta else "7.5",
+                    "poster": meta["poster"] if meta else "https://images.unsplash.com/photo-1578632767115-351597cf2477?w=600",
+                    "banner": meta["banner"] if meta else "https://images.unsplash.com/photo-1578632767115-351597cf2477?w=1200",
+                    "genres": meta["genres"] if meta else "Action, Adventure, Fantasy",
+                    "status": meta["status"] if meta else "Completed",
+                    "description": meta["synopsis"] if meta else "Follow this epic anime adventure as new powers are unleashed.",
+                    "rating": meta["rating"] if meta else "7.8",
                     "year": meta["year"] if meta else "2024",
                     "languages": "Multi-Audio",
                     "episodes": []
                 }
-                await anime_col.insert_one(anime_doc)
+                await anime_col.update_one({"_id": anime_slug}, {"$set": anime_doc}, upsert=True)
             else:
                 anime_doc = existing
 
@@ -483,7 +506,7 @@ async def auto_forward_and_index(client: Client, message: Message):
                 "ep": episode_num,
                 "title": f"Episode {episode_num}",
                 "msg_id": forwarded.id,
-                "file_name": file_name
+                "thumb": f"{FQDN}/thumb/{forwarded.id}"
             }
 
             await anime_col.update_one(
@@ -515,15 +538,14 @@ async def auto_forward_and_index(client: Client, message: Message):
     except Exception as e:
         await message.reply_text(f"Auto-index failed: {str(e)}")
 
-# Dynamic Home Page
+# Home Page with Referrer Header Bypass
 async def handle_home(request):
     if anime_col is None:
-        return web.Response(text="Database connection initializing...", content_type="text/html")
+        return web.Response(text="Database initializing...", content_type="text/html")
 
     anime_list = await anime_col.find().sort("year", -1).to_list(length=100)
-
     if not anime_list:
-        return web.Response(text="<div style='font-family:sans-serif;padding:30px;text-align:center;'><h2>AnimeToon is Live!</h2><p>Upload or forward your anime video files to your Telegram bot to auto-populate the catalog.</p></div>", content_type="text/html")
+        return web.Response(text="<div style='font-family:sans-serif;padding:30px;text-align:center;'><h2>AnimeToon is Live!</h2><p>Forward your anime files to your Telegram bot to index.</p></div>", content_type="text/html")
 
     hero = anime_list[0]
     cards_html = ""
@@ -531,7 +553,7 @@ async def handle_home(request):
         cards_html += f"""
         <a href="/anime/{item['_id']}" class="anime-card">
             <div class="poster-box">
-                <img src="{item.get('poster')}" alt="{item.get('title')}" loading="lazy" />
+                <img src="{item.get('poster')}" alt="{item.get('title')}" referrerpolicy="no-referrer" loading="lazy" />
                 <span class="rating-badge">★ {item.get('rating', '7.0')}</span>
                 <span class="multi-badge">Multi</span>
             </div>
@@ -549,6 +571,7 @@ async def handle_home(request):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="referrer" content="no-referrer">
         <title>AnimeToon</title>
         <style>
             * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; text-decoration: none; }}
@@ -564,7 +587,7 @@ async def handle_home(request):
             .section-title {{ font-size: 17px; font-weight: 800; text-transform: uppercase; border-left: 4px solid #ff2a74; padding-left: 8px; }}
             .anime-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; padding: 0 16px; }}
             .anime-card {{ display: flex; flex-direction: column; }}
-            .poster-box {{ position: relative; border-radius: 14px; overflow: hidden; aspect-ratio: 1/1.4; background: #eee; }}
+            .poster-box {{ position: relative; border-radius: 14px; overflow: hidden; aspect-ratio: 1/1.4; background: #e2e8f0; }}
             .poster-box img {{ width: 100%; height: 100%; object-fit: cover; }}
             .rating-badge {{ position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.7); color: #ffd700; font-size: 11px; padding: 3px 6px; border-radius: 6px; font-weight: 700; }}
             .multi-badge {{ position: absolute; bottom: 8px; right: 8px; background: #ff2a74; color: #fff; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 8px; }}
@@ -579,7 +602,7 @@ async def handle_home(request):
         </header>
 
         <div class="hero-container">
-            <img src="{hero.get('banner')}" class="hero-img" alt="{hero.get('title')}" />
+            <img src="{hero.get('banner')}" class="hero-img" alt="{hero.get('title')}" referrerpolicy="no-referrer" />
             <div class="hero-overlay">
                 <div class="hero-title">{hero.get('title')}</div>
                 <a href="/anime/{hero['_id']}" class="watch-btn">▶ Watch Now</a>
@@ -598,7 +621,7 @@ async def handle_home(request):
     """
     return web.Response(text=html, content_type="text/html")
 
-# Dynamic Anime Details & Episode Selector
+# Anime Details with Real Thumbnails & No-Referrer Images
 async def handle_anime_detail(request):
     if anime_col is None:
         return web.Response(status=500, text="Database Unavailable")
@@ -609,13 +632,21 @@ async def handle_anime_detail(request):
     if not anime:
         return web.Response(status=404, text="Anime Not Found")
 
+    # If description or images were missed on initial upload, auto-repair now
+    if not anime.get("description") or anime.get("description") == "No description available.":
+        re_meta = await fetch_anime_metadata(anime["title"])
+        if re_meta:
+            await anime_col.update_one({"_id": anime_id}, {"$set": re_meta})
+            anime.update(re_meta)
+
     episodes = anime.get("episodes", [])
     episodes_html = ""
     for ep in episodes:
+        thumb_src = ep.get("thumb") or f"{FQDN}/thumb/{ep['msg_id']}"
         episodes_html += f"""
         <a href="/player/{ep['msg_id']}" class="ep-card">
             <div class="ep-thumb">
-                <img src="{anime.get('poster')}" alt="Ep {ep['ep']}" />
+                <img src="{thumb_src}" alt="Ep {ep['ep']}" referrerpolicy="no-referrer" />
             </div>
             <div class="ep-details">
                 <span class="ep-num">S{ep.get('season', 1):02d} E{ep['ep']:02d}</span>
@@ -631,13 +662,14 @@ async def handle_anime_detail(request):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="referrer" content="no-referrer">
         <title>{anime['title']} - AnimeToon</title>
         <style>
             * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; text-decoration: none; }}
             body {{ background-color: #f7f9fc; color: #111; padding-bottom: 40px; }}
             header {{ display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; background: #fff; }}
             .brand {{ font-size: 24px; font-weight: 800; color: #ff2a74; }}
-            .banner-box {{ margin: 12px 16px; border-radius: 18px; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,0.12); }}
+            .banner-box {{ margin: 12px 16px; border-radius: 18px; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,0.12); background: #e2e8f0; }}
             .banner-box img {{ width: 100%; aspect-ratio: 16/10; object-fit: cover; display: block; }}
             .meta-section {{ padding: 0 18px; margin-top: 12px; }}
             .genres {{ font-size: 12px; font-weight: 600; color: #ff2a74; }}
@@ -647,7 +679,7 @@ async def handle_anime_detail(request):
             .season-dropdown {{ margin: 18px 16px 12px; padding: 10px 14px; background: #eef2f6; border-radius: 10px; font-weight: 700; font-size: 14px; }}
             .episodes-list {{ display: flex; flex-direction: column; gap: 12px; padding: 0 16px; }}
             .ep-card {{ display: flex; align-items: center; background: #ffffff; padding: 10px 14px; border-radius: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); border: 1px solid #edf0f5; }}
-            .ep-thumb {{ width: 90px; height: 60px; border-radius: 10px; overflow: hidden; flex-shrink: 0; background: #eee; }}
+            .ep-thumb {{ width: 110px; height: 65px; border-radius: 10px; overflow: hidden; flex-shrink: 0; background: #e2e8f0; }}
             .ep-thumb img {{ width: 100%; height: 100%; object-fit: cover; }}
             .ep-details {{ margin-left: 14px; flex-grow: 1; }}
             .ep-num {{ font-size: 11px; font-weight: 700; color: #666; text-transform: uppercase; }}
@@ -661,13 +693,13 @@ async def handle_anime_detail(request):
         </header>
 
         <div class="banner-box">
-            <img src="{anime.get('banner')}" alt="{anime['title']}" />
+            <img src="{anime.get('banner')}" alt="{anime['title']}" referrerpolicy="no-referrer" />
         </div>
 
         <div class="meta-section">
-            <div class="genres">{anime.get('genres')}</div>
+            <div class="genres">{anime.get('genres', 'Animation, Action')}</div>
             <h1 class="title">{anime['title']}</h1>
-            <p class="desc">{anime.get('description')}</p>
+            <p class="desc">{anime.get('description', 'Follow this epic journey with high-octane action and magical encounters.')}</p>
             <div class="specs">
                 <span>★ {anime.get('rating', '7.5')}</span>
                 <span>•</span>
@@ -690,6 +722,7 @@ async def init_app():
     app = web.Application()
     app.router.add_get("/", handle_home)
     app.router.add_get("/anime/{anime_id}", handle_anime_detail)
+    app.router.add_get("/thumb/{msg_id}", handle_thumbnail)
     app.router.add_get("/watch/{msg_id}", handle_stream)
     app.router.add_get("/api/tracks/{msg_id}", handle_track_info)
     app.router.add_get("/remux/{msg_id}/{track_id}", handle_remux_stream)
