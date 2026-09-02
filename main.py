@@ -28,10 +28,25 @@ bot = Client(
     in_memory=True
 )
 
+LANG_MAP = {
+    "jpn": "Japanese",
+    "eng": "English",
+    "hin": "Hindi",
+    "tel": "Telugu",
+    "tam": "Tamil",
+    "mal": "Malayalam",
+    "kan": "Kannada",
+    "kor": "Korean",
+    "spa": "Spanish",
+    "fra": "French",
+    "ger": "German",
+    "und": "Default Track"
+}
+
 async def handle_ping(request):
     return web.Response(text="Telegram Stream Engine is Online!")
 
-# Direct Telegram Byte Stream (Default)
+# Direct Telegram Byte Stream (Fast seekable range stream)
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -54,7 +69,7 @@ async def handle_stream(request):
             to_byte = file_size - 1
 
         content_length = to_byte - from_byte + 1
-        chunk_size = 1024 * 1024  # 1MB buffer chunk
+        chunk_size = 1024 * 1024
 
         headers = {
             "Content-Type": mime_type,
@@ -93,7 +108,7 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# API: Fast probe of audio streams
+# API: Probe Audio Tracks and Resolve Real Language Names
 async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -121,11 +136,19 @@ async def handle_track_info(request):
         for stream in data.get("streams", []):
             if stream.get("codec_type") == "audio":
                 tags = stream.get("tags", {})
-                title = tags.get("title") or tags.get("language") or f"Audio Track {audio_idx + 1}"
-                lang = tags.get("language", "und").upper()
+                raw_lang = tags.get("language", "und").lower()
+                clean_lang = LANG_MAP.get(raw_lang, raw_lang.capitalize())
+                
+                # Strip promotional text if present
+                title = tags.get("title", "")
+                if "@" in title or not title:
+                    title = f"Track {audio_idx + 1}: {clean_lang}"
+                else:
+                    title = f"{title} ({clean_lang})"
+
                 tracks.append({
                     "id": audio_idx,
-                    "title": f"{title} [{lang}]" if lang != "UND" else title
+                    "title": title
                 })
                 audio_idx += 1
 
@@ -133,25 +156,22 @@ async def handle_track_info(request):
     except Exception:
         return web.json_response({"tracks": []})
 
-# High-Speed Remux Stream (Zero Transcoding Latency)
-async def handle_remux_stream(request):
+# Route: Fast Audio-Only Stream (Low CPU, Immediate Start)
+async def handle_audio_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
         track_id = int(request.match_info["track_id"])
         source_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
         seek_time = request.query.get("ss", "0")
 
-        # Ultra-fast pipeline: Accurate fast seek + stream copy
         cmd = [
             "ffmpeg",
             "-ss", str(seek_time),
             "-i", source_url,
-            "-map", "0:v:0",
             "-map", f"0:a:{track_id}",
-            "-c:v", "copy",
-            "-c:a", "copy",
-            "-movflags", "frag_keyframe+empty_moov+default_base_moof+faststart",
-            "-f", "mp4",
+            "-c:a", "aac",
+            "-b:a", "160k",
+            "-f", "adts",
             "pipe:1"
         ]
 
@@ -164,7 +184,7 @@ async def handle_remux_stream(request):
         response = web.StreamResponse(
             status=200,
             headers={
-                "Content-Type": "video/mp4",
+                "Content-Type": "audio/aac",
                 "Access-Control-Allow-Origin": "*",
                 "Cache-Control": "no-cache"
             }
@@ -172,7 +192,7 @@ async def handle_remux_stream(request):
         await response.prepare(request)
 
         while True:
-            chunk = await process.stdout.read(256 * 1024)
+            chunk = await process.stdout.read(64 * 1024)
             if not chunk:
                 break
             await response.write(chunk)
@@ -231,16 +251,16 @@ async def handle_player(request):
     <body>
         <div class="player-wrapper">
             <div class="artplayer-app"></div>
-            <div class="status-bar" id="status-text">Loading stream info...</div>
+            <div class="status-bar" id="status-text">Detecting audio streams...</div>
         </div>
 
         <script>
-            let currentTrack = 0;
-            const originalUrl = '{stream_url}';
+            let selectedTrack = 0;
+            const extAudio = new Audio();
 
             const art = new Artplayer({{
                 container: '.artplayer-app',
-                url: originalUrl,
+                url: '{stream_url}',
                 volume: 0.8,
                 isLive: false,
                 autoplay: false,
@@ -255,6 +275,29 @@ async def handle_player(request):
                 theme: '#38bdf8'
             }});
 
+            // Synchronize external audio engine with video controls
+            art.on('play', () => {{
+                if (selectedTrack !== 0) extAudio.play();
+            }});
+
+            art.on('pause', () => {{
+                if (selectedTrack !== 0) extAudio.pause();
+            }});
+
+            art.on('seek', (time) => {{
+                if (selectedTrack !== 0) {{
+                    reloadAudioTrack(time);
+                }}
+            }});
+
+            art.on('video:volumechange', () => {{
+                if (selectedTrack !== 0) {{
+                    extAudio.volume = art.volume;
+                    extAudio.muted = art.muted;
+                }}
+            }});
+
+            // Fetch and display clean audio labels
             fetch('{track_info_url}')
                 .then(res => res.json())
                 .then(data => {{
@@ -276,33 +319,43 @@ async def handle_player(request):
                             tooltip: tracks[0].title,
                             selector: selectorList,
                             onSelect: function (item) {{
-                                if (item.value !== currentTrack) {{
-                                    currentTrack = item.value;
-                                    switchAudioStream(item.value);
+                                if (item.value !== selectedTrack) {{
+                                    selectedTrack = item.value;
+                                    handleTrackSwitch(item.value);
                                 }}
                                 return item.html;
                             }}
                         }});
                     }} else {{
-                        statusText.innerText = 'Single Audio Stream';
+                        statusText.innerText = 'Standard Audio Active';
                     }}
                 }});
 
-            function switchAudioStream(trackId) {{
-                const currentTime = Math.floor(art.currentTime);
-                art.notice.show = 'Switching audio track...';
-
+            function handleTrackSwitch(trackId) {{
                 if (trackId === 0) {{
-                    art.switchUrl(originalUrl).then(() => {{
-                        art.currentTime = currentTime;
-                        art.play();
-                    }});
+                    // Default audio track: unmute internal video audio
+                    extAudio.pause();
+                    extAudio.src = '';
+                    art.template.$video.muted = false;
+                    art.notice.show = 'Internal audio activated';
                 }} else {{
-                    const remuxUrl = `{FQDN}/remux/{msg_id}/${{trackId}}?ss=${{currentTime}}`;
-                    art.switchUrl(remuxUrl).then(() => {{
-                        art.play();
-                    }});
+                    // Secondary audio track: mute video track and start demuxed stream
+                    art.template.$video.muted = true;
+                    reloadAudioTrack(art.currentTime);
                 }}
+            }}
+
+            function reloadAudioTrack(timeInSeconds) {{
+                const targetTime = Math.floor(timeInSeconds);
+                art.notice.show = 'Switching audio...';
+                
+                extAudio.src = `{FQDN}/audio/{msg_id}/${{selectedTrack}}?ss=${{targetTime}}`;
+                extAudio.volume = art.volume;
+                extAudio.muted = art.muted;
+
+                extAudio.play().then(() => {{
+                    art.notice.show = 'Audio synchronized';
+                }}).catch(() => {{}});
             }}
         </script>
     </body>
@@ -357,7 +410,7 @@ async def init_app():
     app.router.add_get("/", handle_ping)
     app.router.add_get("/watch/{msg_id}", handle_stream)
     app.router.add_get("/api/tracks/{msg_id}", handle_track_info)
-    app.router.add_get("/remux/{msg_id}/{track_id}", handle_remux_stream)
+    app.router.add_get("/audio/{msg_id}/{track_id}", handle_audio_stream)
     app.router.add_get("/player/{msg_id}", handle_player)
     return app
 
