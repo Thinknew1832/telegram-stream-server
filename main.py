@@ -43,13 +43,13 @@ LANG_MAP = {
     "und": "Default"
 }
 
-# Strict single-process lock to stay within Render 512MB RAM
-DEMUX_LOCK = asyncio.Semaphore(1)
+# Semaphore to strictly manage memory on Render 512MB RAM
+DEMUX_LOCK = asyncio.Semaphore(2)
 
 async def handle_ping(request):
     return web.Response(text="Telegram Stream Engine is Online!")
 
-# 1. Native Byte Stream (Used internally as input to FFmpeg & direct fallback)
+# 1. Native Telegram Byte Stream (Default Direct Route)
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -108,7 +108,7 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# 2. Probe Track Metadata (Returns track titles & duration)
+# 2. Probe Track Metadata
 async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -117,8 +117,8 @@ async def handle_track_info(request):
         cmd = [
             "ffprobe",
             "-v", "error",
-            "-probesize", "4000000",
-            "-analyzeduration", "2000000",
+            "-probesize", "3000000",
+            "-analyzeduration", "1500000",
             "-show_entries", "stream=index,codec_name,codec_type:stream_tags=language,title:format=duration",
             "-of", "json",
             source_url
@@ -142,7 +142,6 @@ async def handle_track_info(request):
                 clean_lang = LANG_MAP.get(raw_lang, raw_lang.capitalize())
                 title = tags.get("title", "")
                 
-                # Replace spam/watermark titles with real language label
                 if "@" in title or not title:
                     title = f"Track {audio_idx + 1}: {clean_lang}"
                 else:
@@ -158,17 +157,18 @@ async def handle_track_info(request):
             "duration": duration,
             "tracks": tracks
         }, headers={"Access-Control-Allow-Origin": "*"})
-    except Exception as e:
+    except Exception:
         return web.json_response({"duration": 0, "tracks": []})
 
-# 3. True Server-Side Demuxer (Stream-copies video + isolates selected audio track)
+# 3. Server-Side Demuxer with Low-Latency Seeking and Timestamp Alignment
 async def handle_demux_stream(request):
     msg_id = int(request.match_info["msg_id"])
     track_id = int(request.match_info["track_id"])
-    seek_time = request.query.get("ss", "0")
+    seek_time = float(request.query.get("ss", "0"))
     source_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
 
-    # Fast seek on HTTP source, map video stream 0 and chosen audio track
+    # -ss before -i enables input-level seek (jumps directly via byte ranges)
+    # -avoid_negative_ts make_zero prevents audio desynchronization on keyframe hops
     cmd = [
         "ffmpeg",
         "-ss", str(seek_time),
@@ -178,6 +178,8 @@ async def handle_demux_stream(request):
         "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", "160k",
+        "-copyts",
+        "-avoid_negative_ts", "make_zero",
         "-movflags", "frag_keyframe+empty_moov+default_base_moof",
         "-f", "mp4",
         "pipe:1"
@@ -188,6 +190,7 @@ async def handle_demux_stream(request):
         headers={
             "Content-Type": "video/mp4",
             "Access-Control-Allow-Origin": "*",
+            "Accept-Ranges": "none",
             "Cache-Control": "no-cache"
         }
     )
@@ -218,7 +221,7 @@ async def handle_demux_stream(request):
 
     return response
 
-# 4. Web Player Interface with Seamless Track Switching
+# 4. Web Player Interface (Persistent Playback Time across Audio Switches)
 async def handle_player(request):
     msg_id = request.match_info["msg_id"]
     default_stream_url = f"{FQDN}/watch/{msg_id}"
@@ -230,12 +233,12 @@ async def handle_player(request):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Anime Player - Server Demuxer</title>
+        <title>Anime Stream Player</title>
         <script src="https://cdn.jsdelivr.net/npm/artplayer/dist/artplayer.js"></script>
         <style>
             * {{ box-sizing: border-box; margin: 0; padding: 0; }}
             body {{
-                background-color: #090b10;
+                background-color: #080a10;
                 color: #ffffff;
                 display: flex;
                 flex-direction: column;
@@ -267,13 +270,14 @@ async def handle_player(request):
     <body>
         <div class="player-wrapper">
             <div class="artplayer-app"></div>
-            <div class="status-bar" id="status-text">Connecting demuxer engine...</div>
+            <div class="status-bar" id="status-text">Synchronizing stream engine...</div>
         </div>
 
         <script>
             let currentTrack = 0;
-            let currentSeekOffset = 0;
-            let fullDuration = 0;
+            let totalDuration = 0;
+            let isSwitching = false;
+            let targetSeekTime = 0;
             const originalUrl = '{default_stream_url}';
 
             const art = new Artplayer({{
@@ -293,13 +297,32 @@ async def handle_player(request):
                 theme: '#38bdf8'
             }});
 
-            // Preserve and fix duration display across stream hops
+            // Preserve duration and jump to the exact timestamp after stream replacement
             art.on('video:loadedmetadata', () => {{
-                if (fullDuration > 0 && art.duration < fullDuration) {{
-                    Object.defineProperty(art.template.$video, 'duration', {{
-                        configurable: true,
-                        get: () => fullDuration
-                    }});
+                if (totalDuration > 0) {{
+                    try {{
+                        Object.defineProperty(art.template.$video, 'duration', {{
+                            configurable: true,
+                            get: () => totalDuration
+                        }});
+                    }} catch (e) {{}}
+                }}
+
+                if (isSwitching && targetSeekTime > 0) {{
+                    // For remux streams, time offset is handled at stream origin or via currentTime
+                    if (currentTrack === 0) {{
+                        art.currentTime = targetSeekTime;
+                    }}
+                    art.play();
+                    isSwitching = false;
+                    art.notice.show = 'Track Synced';
+                }}
+            }});
+
+            // Intercept user manual seek events when playing a remux track
+            art.on('seek', (time) => {{
+                if (currentTrack !== 0 && !isSwitching) {{
+                    switchAudioServer(currentTrack, Math.floor(time));
                 }}
             }});
 
@@ -307,7 +330,7 @@ async def handle_player(request):
                 .then(res => res.json())
                 .then(data => {{
                     const tracks = data.tracks || [];
-                    fullDuration = data.duration || 0;
+                    totalDuration = data.duration || 0;
                     const statusText = document.getElementById('status-text');
 
                     if (tracks.length > 0) {{
@@ -326,8 +349,9 @@ async def handle_player(request):
                             selector: selectorList,
                             onSelect: function (item) {{
                                 if (item.value !== currentTrack) {{
+                                    const currentSec = Math.floor(art.currentTime);
                                     currentTrack = item.value;
-                                    switchAudioServer(item.value);
+                                    switchAudioServer(item.value, currentSec);
                                 }}
                                 return item.html;
                             }}
@@ -337,21 +361,20 @@ async def handle_player(request):
                     }}
                 }});
 
-            function switchAudioServer(trackId) {{
-                const currentTime = Math.floor(art.currentTime);
-                art.notice.show = 'Demuxing audio track...';
+            function switchAudioServer(trackId, resumeTime) {{
+                isSwitching = true;
+                targetSeekTime = resumeTime;
+                art.notice.show = 'Changing audio track...';
 
                 if (trackId === 0) {{
                     art.switchUrl(originalUrl).then(() => {{
-                        art.currentTime = currentTime;
+                        art.currentTime = resumeTime;
                         art.play();
-                        art.notice.show = 'Switched to Track 1';
                     }});
                 }} else {{
-                    const demuxUrl = `{FQDN}/demux/{msg_id}/${{trackId}}?ss=${{currentTime}}`;
+                    const demuxUrl = `{FQDN}/demux/{msg_id}/${{trackId}}?ss=${{resumeTime}}`;
                     art.switchUrl(demuxUrl).then(() => {{
                         art.play();
-                        art.notice.show = `Track ${{trackId + 1}} Active`;
                     }});
                 }}
             }}
