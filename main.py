@@ -17,7 +17,7 @@ BIND_ADDRESS = os.getenv("BIND_ADDRESS", "0.0.0.0")
 FQDN = os.getenv("FQDN", f"http://localhost:{PORT}").rstrip("/")
 
 if not API_ID or not API_HASH or not BOT_TOKEN or not BIN_CHANNEL:
-    print("[CRITICAL ERROR] Missing required environment variables: API_ID, API_HASH, BOT_TOKEN, or BIN_CHANNEL.")
+    print("[CRITICAL ERROR] Missing required environment variables.")
     sys.exit(1)
 
 bot = Client(
@@ -44,7 +44,6 @@ LANG_MAP = {
 }
 
 META_CACHE = {}
-DEMUX_LOCK = asyncio.Semaphore(2)
 
 async def handle_ping(request):
     return web.Response(text="AnimeToon Stream Engine Online")
@@ -103,29 +102,44 @@ async def stream_telegram_media(msg: Message, request: web.Request):
 
     return response
 
-# Main Stream Router (Remuxes MKVs to MP4 container with AAC audio on-the-fly)
-async def handle_stream(request):
+# Internal raw route for FFmpeg
+async def handle_raw_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
         msg: Message = await bot.get_messages(BIN_CHANNEL, msg_id)
-        media = msg.video or msg.document or msg.audio
+        return await stream_telegram_media(msg, request)
+    except Exception as e:
+        return web.Response(status=500, text=str(e))
 
+# Primary stream handler (MKV auto-remuxing to fragmented MP4)
+async def handle_stream(request):
+    try:
+        msg_id = int(request.match_info["msg_id"])
+        track_id = request.query.get("track", "0")
+        start_time = request.query.get("ss", "0")
+
+        msg: Message = await bot.get_messages(BIN_CHANNEL, msg_id)
+        media = msg.video or msg.document or msg.audio
         if not media:
             return web.Response(status=404, text="Media not found.")
 
         file_name = (getattr(media, "file_name", "") or "").lower()
         mime_type = (media.mime_type or "").lower()
 
-        # Pure MP4 files can be streamed natively without FFmpeg overhead
-        if mime_type == "video/mp4" and not file_name.endswith(".mkv"):
+        # Direct streaming for native MP4s when no track/seek modifications are requested
+        if mime_type == "video/mp4" and not file_name.endswith(".mkv") and track_id == "0" and start_time == "0":
             return await stream_telegram_media(msg, request)
 
-        # Non-MP4 (e.g., MKV with Opus/AC3/EAC3) gets remuxed to MP4 on-the-fly
         source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
-        cmd = [
-            "ffmpeg",
-            "-re",
+
+        # Build FFmpeg command with seek support and browser-safe streaming
+        cmd = ["ffmpeg"]
+        if start_time != "0":
+            cmd += ["-ss", str(start_time)]
+        cmd += [
             "-i", source_url,
+            "-map", "0:v:0",
+            "-map", f"0:a:{track_id}?",
             "-c:v", "copy",
             "-c:a", "aac",
             "-b:a", "160k",
@@ -144,40 +158,80 @@ async def handle_stream(request):
         )
         await response.prepare(request)
 
-        async with DEMUX_LOCK:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL
-            )
-            try:
-                while True:
-                    chunk = await process.stdout.read(64 * 1024)
-                    if not chunk:
-                        break
-                    await response.write(chunk)
-            except (asyncio.CancelledError, ConnectionResetError):
-                pass
-            finally:
-                if process.returncode is None:
-                    try:
-                        process.kill()
-                        await process.wait()
-                    except Exception:
-                        pass
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+
+        try:
+            while True:
+                chunk = await process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                await response.write(chunk)
+        except (asyncio.CancelledError, ConnectionResetError):
+            pass
+        finally:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                    await process.wait()
+                except Exception:
+                    pass
 
         return response
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# Raw internal stream endpoint consumed by FFmpeg
-async def handle_raw_stream(request):
+# Get Audio Tracks for UI Selector
+async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
-        msg: Message = await bot.get_messages(BIN_CHANNEL, msg_id)
-        return await stream_telegram_media(msg, request)
-    except Exception as e:
-        return web.Response(status=500, text=str(e))
+        if msg_id in META_CACHE:
+            return web.json_response(META_CACHE[msg_id], headers={"Access-Control-Allow-Origin": "*"})
+
+        source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-probesize", "5000000",
+            "-analyzeduration", "3000000",
+            "-show_entries", "stream=index,codec_type:stream_tags=language,title:format=duration",
+            "-of", "json",
+            source_url
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        data = json.loads(stdout.decode())
+
+        duration = float(data.get("format", {}).get("duration", 0))
+        tracks = []
+        audio_idx = 0
+
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "audio":
+                tags = stream.get("tags", {})
+                raw_lang = tags.get("language", "und").lower()
+                clean_lang = LANG_MAP.get(raw_lang, raw_lang.capitalize())
+                title = tags.get("title", "")
+                label = f"{title} ({clean_lang})" if title and "@" not in title else f"Track {audio_idx + 1} - {clean_lang}"
+                tracks.append({"id": audio_idx, "title": label})
+                audio_idx += 1
+
+        if not tracks:
+            tracks.append({"id": 0, "title": "Default Audio"})
+
+        res = {"duration": duration, "tracks": tracks}
+        META_CACHE[msg_id] = res
+        return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
+    except Exception:
+        return web.json_response({"duration": 0, "tracks": [{"id": 0, "title": "Default Audio"}]}, headers={"Access-Control-Allow-Origin": "*"})
 
 # Telegram Thumbnail Server
 async def handle_thumbnail(request):
@@ -203,111 +257,7 @@ async def handle_thumbnail(request):
     fallback_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90" viewBox="0 0 160 90"><rect width="160" height="90" fill="#141414"/><text x="50%" y="50%" fill="#555" font-family="sans-serif" font-size="12" text-anchor="middle" dy=".3em">Episode</text></svg>'
     return web.Response(text=fallback_svg, content_type="image/svg+xml", headers={"Access-Control-Allow-Origin": "*"})
 
-# Track Metadata Inspector
-async def handle_track_info(request):
-    msg_id = int(request.match_info["msg_id"])
-    if msg_id in META_CACHE:
-        return web.json_response(META_CACHE[msg_id], headers={"Access-Control-Allow-Origin": "*"})
-
-    source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
-    try:
-        cmd = [
-            "ffprobe",
-            "-v", "error",
-            "-probesize", "3000000",
-            "-analyzeduration", "1500000",
-            "-show_entries", "stream=index,codec_name,codec_type:stream_tags=language,title:format=duration",
-            "-of", "json",
-            source_url
-        ]
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await process.communicate()
-        data = json.loads(stdout.decode())
-
-        duration = float(data.get("format", {}).get("duration", 0))
-        tracks = []
-        audio_idx = 0
-
-        for stream in data.get("streams", []):
-            if stream.get("codec_type") == "audio":
-                tags = stream.get("tags", {})
-                raw_lang = tags.get("language", "und").lower()
-                clean_lang = LANG_MAP.get(raw_lang, raw_lang.capitalize())
-                title = tags.get("title", "")
-                if "@" in title or not title:
-                    title = f"Track {audio_idx + 1}: {clean_lang}"
-                else:
-                    title = f"{title} [{clean_lang}]"
-
-                tracks.append({"id": audio_idx, "title": title})
-                audio_idx += 1
-
-        res = {"duration": duration, "tracks": tracks}
-        META_CACHE[msg_id] = res
-        return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
-    except Exception:
-        return web.json_response({"duration": 0, "tracks": []}, headers={"Access-Control-Allow-Origin": "*"})
-
-# Specific Audio Track Remux Endpoint
-async def handle_remux_stream(request):
-    msg_id = int(request.match_info["msg_id"])
-    track_id = int(request.match_info["track_id"])
-    seek_time = request.query.get("ss", "0")
-    source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
-
-    cmd = [
-        "ffmpeg",
-        "-ss", str(seek_time),
-        "-i", source_url,
-        "-map", "0:v:0",
-        "-map", f"0:a:{track_id}",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", "160k",
-        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-        "-f", "mp4",
-        "pipe:1"
-    ]
-
-    response = web.StreamResponse(
-        status=200,
-        headers={
-            "Content-Type": "video/mp4",
-            "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "no-cache"
-        }
-    )
-    await response.prepare(request)
-
-    async with DEMUX_LOCK:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-        try:
-            while True:
-                chunk = await process.stdout.read(64 * 1024)
-                if not chunk:
-                    break
-                await response.write(chunk)
-        except (asyncio.CancelledError, ConnectionResetError):
-            pass
-        finally:
-            if process.returncode is None:
-                try:
-                    process.kill()
-                    await process.wait()
-                except Exception:
-                    pass
-
-    return response
-
-# Telegram Bot File Assistant: Gives msg_id for your spreadsheet
+# Bot Assistant Handler
 @bot.on_message(filters.private & (filters.document | filters.video | filters.audio))
 async def bot_file_handler(client: Client, message: Message):
     try:
@@ -336,7 +286,6 @@ async def init_app():
     app.router.add_get("/raw/{msg_id}", handle_raw_stream)
     app.router.add_get("/thumb/{msg_id}", handle_thumbnail)
     app.router.add_get("/api/tracks/{msg_id}", handle_track_info)
-    app.router.add_get("/remux/{msg_id}/{track_id}", handle_remux_stream)
     return app
 
 if __name__ == "__main__":
