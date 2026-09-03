@@ -3,6 +3,7 @@ import math
 import sys
 import json
 import asyncio
+import urllib.request
 from aiohttp import web
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
@@ -14,10 +15,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 BIN_CHANNEL = int(os.getenv("BIN_CHANNEL", "0"))
 PORT = int(os.getenv("PORT", "8080"))
 BIND_ADDRESS = os.getenv("BIND_ADDRESS", "0.0.0.0")
-FQDN = os.getenv("FQDN", f"http://localhost:{PORT}").rstrip("/")
+FQDN = os.getenv("FQDN", f"https://telegram-stream-server-vglf.onrender.com").rstrip("/")
 
 if not API_ID or not API_HASH or not BOT_TOKEN or not BIN_CHANNEL:
-    print("[CRITICAL ERROR] Missing required environment variables.")
+    print("[CRITICAL ERROR] Missing required environment variables: API_ID, API_HASH, BOT_TOKEN, or BIN_CHANNEL.")
     sys.exit(1)
 
 bot = Client(
@@ -44,9 +45,18 @@ LANG_MAP = {
 }
 
 META_CACHE = {}
+DEMUX_LOCK = asyncio.Semaphore(2)
 
 async def handle_ping(request):
     return web.Response(text="AnimeToon Stream Engine Online")
+
+# Helper to fetch message with auto peer re-resolution
+async def get_channel_message(msg_id: int) -> Message:
+    try:
+        return await bot.get_messages(BIN_CHANNEL, msg_id)
+    except Exception:
+        await bot.get_chat(BIN_CHANNEL)
+        return await bot.get_messages(BIN_CHANNEL, msg_id)
 
 # Raw byte streaming directly out of Telegram
 async def stream_telegram_media(msg: Message, request: web.Request):
@@ -95,6 +105,7 @@ async def stream_telegram_media(msg: Message, request: web.Request):
             chunk = chunk[:content_length - bytes_sent]
 
         await response.write(chunk)
+        await response.drain()
         bytes_sent += len(chunk)
 
         if bytes_sent >= content_length:
@@ -106,7 +117,7 @@ async def stream_telegram_media(msg: Message, request: web.Request):
 async def handle_raw_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
-        msg: Message = await bot.get_messages(BIN_CHANNEL, msg_id)
+        msg = await get_channel_message(msg_id)
         return await stream_telegram_media(msg, request)
     except Exception as e:
         return web.Response(status=500, text=str(e))
@@ -118,7 +129,7 @@ async def handle_stream(request):
         track_id = request.query.get("track", "0")
         start_time = request.query.get("ss", "0")
 
-        msg: Message = await bot.get_messages(BIN_CHANNEL, msg_id)
+        msg = await get_channel_message(msg_id)
         media = msg.video or msg.document or msg.audio
         if not media:
             return web.Response(status=404, text="Media not found.")
@@ -126,13 +137,12 @@ async def handle_stream(request):
         file_name = (getattr(media, "file_name", "") or "").lower()
         mime_type = (media.mime_type or "").lower()
 
-        # Direct streaming for native MP4s when no track/seek modifications are requested
+        # Direct streaming for native MP4s if no audio track change or custom seek
         if mime_type == "video/mp4" and not file_name.endswith(".mkv") and track_id == "0" and start_time == "0":
             return await stream_telegram_media(msg, request)
 
         source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
 
-        # Build FFmpeg command with seek support and browser-safe streaming
         cmd = ["ffmpeg"]
         if start_time != "0":
             cmd += ["-ss", str(start_time)]
@@ -158,27 +168,29 @@ async def handle_stream(request):
         )
         await response.prepare(request)
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL
-        )
+        async with DEMUX_LOCK:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
 
-        try:
-            while True:
-                chunk = await process.stdout.read(64 * 1024)
-                if not chunk:
-                    break
-                await response.write(chunk)
-        except (asyncio.CancelledError, ConnectionResetError):
-            pass
-        finally:
-            if process.returncode is None:
-                try:
-                    process.kill()
-                    await process.wait()
-                except Exception:
-                    pass
+            try:
+                while True:
+                    chunk = await process.stdout.read(64 * 1024)
+                    if not chunk:
+                        break
+                    await response.write(chunk)
+                    await response.drain()
+            except (asyncio.CancelledError, ConnectionResetError):
+                pass
+            finally:
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                        await process.wait()
+                    except Exception:
+                        pass
 
         return response
     except Exception as e:
@@ -237,7 +249,7 @@ async def handle_track_info(request):
 async def handle_thumbnail(request):
     try:
         msg_id = int(request.match_info["msg_id"])
-        msg: Message = await bot.get_messages(BIN_CHANNEL, msg_id)
+        msg = await get_channel_message(msg_id)
         media = msg.video or msg.document
 
         if media and hasattr(media, "thumbs") and media.thumbs:
@@ -257,10 +269,15 @@ async def handle_thumbnail(request):
     fallback_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90" viewBox="0 0 160 90"><rect width="160" height="90" fill="#141414"/><text x="50%" y="50%" fill="#555" font-family="sans-serif" font-size="12" text-anchor="middle" dy=".3em">Episode</text></svg>'
     return web.Response(text=fallback_svg, content_type="image/svg+xml", headers={"Access-Control-Allow-Origin": "*"})
 
-# Bot Assistant Handler
+# Telegram Bot File Assistant
 @bot.on_message(filters.private & (filters.document | filters.video | filters.audio))
 async def bot_file_handler(client: Client, message: Message):
     try:
+        try:
+            await client.get_chat(BIN_CHANNEL)
+        except Exception:
+            pass
+
         forwarded = await message.forward(chat_id=BIN_CHANNEL)
         name = "Unknown File"
         if message.document and message.document.file_name:
@@ -277,7 +294,20 @@ async def bot_file_handler(client: Client, message: Message):
         )
         await message.reply_text(reply_text, parse_mode=enums.ParseMode.HTML)
     except Exception as e:
-        await message.reply_text(f"Processing error: {str(e)}")
+        await message.reply_text(f"⚠️ <b>Processing error:</b> <code>{str(e)}</code>", parse_mode=enums.ParseMode.HTML)
+
+# Self Keep-Alive Worker
+async def keep_alive_worker():
+    await asyncio.sleep(20)
+    url = f"http://127.0.0.1:{PORT}/"
+    while True:
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: urllib.request.urlopen(url, timeout=10))
+            print("[KEEP-ALIVE] Ping successful.")
+        except Exception as e:
+            print(f"[KEEP-ALIVE WARNING] {e}")
+        await asyncio.sleep(240)
 
 async def init_app():
     app = web.Application()
@@ -293,12 +323,22 @@ if __name__ == "__main__":
 
     async def run():
         await bot.start()
+
+        # Prime and cache BIN_CHANNEL peer immediately
+        try:
+            chat = await bot.get_chat(BIN_CHANNEL)
+            print(f"[INIT] Channel cached successfully: {chat.title} ({chat.id})")
+        except Exception as e:
+            print(f"[INIT ERROR] Failed to cache channel: {e}")
+
         app = await init_app()
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, BIND_ADDRESS, PORT)
         await site.start()
         print(f"Server is listening on port {PORT}")
+
+        asyncio.create_task(keep_alive_worker())
         await asyncio.Event().wait()
 
     loop.run_until_complete(run())
