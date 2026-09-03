@@ -12,13 +12,19 @@ from pyrogram.types import Message
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-BIN_CHANNEL = int(os.getenv("BIN_CHANNEL", "0"))
+
+raw_channel = os.getenv("BIN_CHANNEL", "").strip()
+try:
+    BIN_CHANNEL = int(raw_channel)
+except ValueError:
+    BIN_CHANNEL = raw_channel  # Handles '@animetoon_storage_bin'
+
 PORT = int(os.getenv("PORT", "8080"))
 BIND_ADDRESS = os.getenv("BIND_ADDRESS", "0.0.0.0")
-FQDN = os.getenv("FQDN", f"https://telegram-stream-server-vglf.onrender.com").rstrip("/")
+FQDN = os.getenv("FQDN", "https://telegram-stream-server-vglf.onrender.com").rstrip("/")
 
 if not API_ID or not API_HASH or not BOT_TOKEN or not BIN_CHANNEL:
-    print("[CRITICAL ERROR] Missing required environment variables: API_ID, API_HASH, BOT_TOKEN, or BIN_CHANNEL.")
+    print("[CRITICAL ERROR] Missing required environment variables.")
     sys.exit(1)
 
 bot = Client(
@@ -50,7 +56,7 @@ DEMUX_LOCK = asyncio.Semaphore(2)
 async def handle_ping(request):
     return web.Response(text="AnimeToon Stream Engine Online")
 
-# Helper to fetch message with auto peer re-resolution
+# Peer-safe message retriever
 async def get_channel_message(msg_id: int) -> Message:
     try:
         return await bot.get_messages(BIN_CHANNEL, msg_id)
@@ -122,7 +128,7 @@ async def handle_raw_stream(request):
     except Exception as e:
         return web.Response(status=500, text=str(e))
 
-# Primary stream handler (MKV auto-remuxing to fragmented MP4)
+# Stream router (Remuxes MKVs on-the-fly to MP4 + AAC)
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -137,7 +143,7 @@ async def handle_stream(request):
         file_name = (getattr(media, "file_name", "") or "").lower()
         mime_type = (media.mime_type or "").lower()
 
-        # Direct streaming for native MP4s if no audio track change or custom seek
+        # Stream native MP4s directly without re-muxing if standard
         if mime_type == "video/mp4" and not file_name.endswith(".mkv") and track_id == "0" and start_time == "0":
             return await stream_telegram_media(msg, request)
 
@@ -196,7 +202,7 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# Get Audio Tracks for UI Selector
+# Get Audio Tracks for Player Selector
 async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
