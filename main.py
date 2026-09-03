@@ -17,7 +17,7 @@ raw_channel = os.getenv("BIN_CHANNEL", "").strip()
 try:
     BIN_CHANNEL = int(raw_channel)
 except ValueError:
-    BIN_CHANNEL = raw_channel  # Handles '@animetoon_storage_bin'
+    BIN_CHANNEL = raw_channel
 
 PORT = int(os.getenv("PORT", "8080"))
 BIND_ADDRESS = os.getenv("BIND_ADDRESS", "0.0.0.0")
@@ -51,12 +51,11 @@ LANG_MAP = {
 }
 
 META_CACHE = {}
-DEMUX_LOCK = asyncio.Semaphore(2)
+DEMUX_LOCK = asyncio.Semaphore(3)
 
 async def handle_ping(request):
     return web.Response(text="AnimeToon Stream Engine Online")
 
-# Peer-safe message retriever
 async def get_channel_message(msg_id: int) -> Message:
     try:
         return await bot.get_messages(BIN_CHANNEL, msg_id)
@@ -64,7 +63,7 @@ async def get_channel_message(msg_id: int) -> Message:
         await bot.get_chat(BIN_CHANNEL)
         return await bot.get_messages(BIN_CHANNEL, msg_id)
 
-# Raw byte streaming directly out of Telegram
+# Standard Range-Supported Telegram Stream
 async def stream_telegram_media(msg: Message, request: web.Request):
     media = msg.video or msg.document or msg.audio
     if not media:
@@ -119,7 +118,6 @@ async def stream_telegram_media(msg: Message, request: web.Request):
 
     return response
 
-# Internal raw route for FFmpeg
 async def handle_raw_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -128,7 +126,7 @@ async def handle_raw_stream(request):
     except Exception as e:
         return web.Response(status=500, text=str(e))
 
-# Stream router (Remuxes MKVs on-the-fly to MP4 + AAC)
+# FFmpeg Remuxer with Seeking Support
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -143,12 +141,13 @@ async def handle_stream(request):
         file_name = (getattr(media, "file_name", "") or "").lower()
         mime_type = (media.mime_type or "").lower()
 
-        # Stream native MP4s directly without re-muxing if standard
+        # If it's a native MP4 with standard AAC audio and no seek offset requested
         if mime_type == "video/mp4" and not file_name.endswith(".mkv") and track_id == "0" and start_time == "0":
             return await stream_telegram_media(msg, request)
 
         source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
 
+        # Fast input-seeking prior to decode
         cmd = ["ffmpeg"]
         if start_time != "0":
             cmd += ["-ss", str(start_time)]
@@ -164,14 +163,17 @@ async def handle_stream(request):
             "pipe:1"
         ]
 
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "video/mp4",
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "no-cache",
-            }
-        )
+        headers = {
+            "Content-Type": "video/mp4",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Range, Content-Type",
+            "Cache-Control": "no-cache",
+        }
+
+        if request.method == "HEAD":
+            return web.Response(status=200, headers=headers)
+
+        response = web.StreamResponse(status=200, headers=headers)
         await response.prepare(request)
 
         async with DEMUX_LOCK:
@@ -202,7 +204,7 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# Get Audio Tracks for Player Selector
+# Track Metadata & Duration Probe
 async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -238,7 +240,7 @@ async def handle_track_info(request):
                 raw_lang = tags.get("language", "und").lower()
                 clean_lang = LANG_MAP.get(raw_lang, raw_lang.capitalize())
                 title = tags.get("title", "")
-                label = f"{title} ({clean_lang})" if title and "@" not in title else f"Track {audio_idx + 1} - {clean_lang}"
+                label = f"{title} ({clean_lang})" if title and "@" not in title else f"Track {audio_idx + 1} ({clean_lang})"
                 tracks.append({"id": audio_idx, "title": label})
                 audio_idx += 1
 
@@ -251,7 +253,6 @@ async def handle_track_info(request):
     except Exception:
         return web.json_response({"duration": 0, "tracks": [{"id": 0, "title": "Default Audio"}]}, headers={"Access-Control-Allow-Origin": "*"})
 
-# Telegram Thumbnail Server
 async def handle_thumbnail(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -275,7 +276,6 @@ async def handle_thumbnail(request):
     fallback_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90" viewBox="0 0 160 90"><rect width="160" height="90" fill="#141414"/><text x="50%" y="50%" fill="#555" font-family="sans-serif" font-size="12" text-anchor="middle" dy=".3em">Episode</text></svg>'
     return web.Response(text=fallback_svg, content_type="image/svg+xml", headers={"Access-Control-Allow-Origin": "*"})
 
-# Telegram Bot File Assistant
 @bot.on_message(filters.private & (filters.document | filters.video | filters.audio))
 async def bot_file_handler(client: Client, message: Message):
     try:
@@ -302,7 +302,6 @@ async def bot_file_handler(client: Client, message: Message):
     except Exception as e:
         await message.reply_text(f"⚠️ <b>Processing error:</b> <code>{str(e)}</code>", parse_mode=enums.ParseMode.HTML)
 
-# Self Keep-Alive Worker
 async def keep_alive_worker():
     await asyncio.sleep(20)
     url = f"http://127.0.0.1:{PORT}/"
@@ -330,7 +329,6 @@ if __name__ == "__main__":
     async def run():
         await bot.start()
 
-        # Prime and cache BIN_CHANNEL peer immediately
         try:
             chat = await bot.get_chat(BIN_CHANNEL)
             print(f"[INIT] Channel cached successfully: {chat.title} ({chat.id})")
