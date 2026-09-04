@@ -8,6 +8,7 @@ from aiohttp import web
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
+# Configurations
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -50,6 +51,7 @@ LANG_MAP = {
 }
 
 META_CACHE = {}
+DEMUX_LOCK = asyncio.Semaphore(2)
 
 async def handle_ping(request):
     return web.Response(text="AnimeToon Stream Engine Online")
@@ -61,81 +63,160 @@ async def get_channel_message(msg_id: int) -> Message:
         await bot.get_chat(BIN_CHANNEL)
         return await bot.get_messages(BIN_CHANNEL, msg_id)
 
-# Full HTTP Range Request Handler for Telegram Media
+# Telegram media byte streamer (Supports standard Range Requests)
+async def stream_telegram_media(msg: Message, request: web.Request):
+    media = msg.video or msg.document or msg.audio
+    if not media:
+        return web.Response(status=404, text="Media not found.")
+
+    file_size = media.file_size
+    range_header = request.headers.get("Range")
+
+    if range_header:
+        byte_range = range_header.replace("bytes=", "").split("-")
+        from_byte = int(byte_range[0])
+        to_byte = int(byte_range[1]) if len(byte_range) > 1 and byte_range[1] else file_size - 1
+    else:
+        from_byte = 0
+        to_byte = file_size - 1
+
+    content_length = to_byte - from_byte + 1
+    chunk_size = 1024 * 1024
+
+    headers = {
+        "Content-Type": "video/mp4",
+        "Accept-Ranges": "bytes",
+        "Content-Range": f"bytes {from_byte}-{to_byte}/{file_size}",
+        "Content-Length": str(content_length),
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Range, Content-Type",
+    }
+
+    if request.method == "HEAD":
+        return web.Response(status=200, headers=headers)
+
+    response = web.StreamResponse(status=206 if range_header else 200, headers=headers)
+    await response.prepare(request)
+
+    offset = int(math.floor(from_byte / chunk_size))
+    bytes_sent = 0
+
+    async for chunk in bot.stream_media(msg, offset=offset):
+        if bytes_sent == 0 and (from_byte % chunk_size) != 0:
+            chunk = chunk[(from_byte % chunk_size):]
+
+        if bytes_sent + len(chunk) > content_length:
+            chunk = chunk[:content_length - bytes_sent]
+
+        await response.write(chunk)
+        await response.drain()
+        bytes_sent += len(chunk)
+
+        if bytes_sent >= content_length:
+            break
+
+    return response
+
+# Internal endpoint consumed by FFmpeg and ffprobe
+async def handle_raw_stream(request):
+    try:
+        msg_id = int(request.match_info["msg_id"])
+        msg = await get_channel_message(msg_id)
+        return await stream_telegram_media(msg, request)
+    except Exception as e:
+        return web.Response(status=500, text=str(e))
+
+# Primary stream route: Handles audio track extraction and fast-seeking
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
+        track_id = request.query.get("track", "0")
+        start_time = request.query.get("ss", "0")
+
         msg = await get_channel_message(msg_id)
         media = msg.video or msg.document or msg.audio
         if not media:
             return web.Response(status=404, text="Media not found.")
 
-        file_size = media.file_size
-        range_header = request.headers.get("Range")
+        file_name = (getattr(media, "file_name", "") or "").lower()
+        mime_type = (media.mime_type or "").lower()
 
-        if range_header:
-            byte_range = range_header.replace("bytes=", "").split("-")
-            from_byte = int(byte_range[0])
-            to_byte = int(byte_range[1]) if len(byte_range) > 1 and byte_range[1] else file_size - 1
-        else:
-            from_byte = 0
-            to_byte = file_size - 1
+        # If it's a native single-track MP4 and no track switch or seek is requested
+        if mime_type == "video/mp4" and not file_name.endswith(".mkv") and track_id == "0" and start_time == "0":
+            return await stream_telegram_media(msg, request)
 
-        content_length = to_byte - from_byte + 1
-        chunk_size = 1024 * 1024  # 1MB chunks
+        source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
 
-        headers = {
-            "Content-Type": "video/mp4",
-            "Accept-Ranges": "bytes",
-            "Content-Range": f"bytes {from_byte}-{to_byte}/{file_size}",
-            "Content-Length": str(content_length),
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "Range, Content-Type",
-        }
-
-        if request.method == "HEAD":
-            return web.Response(status=200, headers=headers)
+        # FFmpeg remuxing: maps requested audio track and audio transcodes to browser AAC
+        cmd = ["ffmpeg"]
+        if start_time != "0":
+            cmd += ["-ss", str(start_time)]
+        cmd += [
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-i", source_url,
+            "-map", "0:v:0",
+            "-map", f"0:a:{track_id}?",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4",
+            "pipe:1"
+        ]
 
         response = web.StreamResponse(
-            status=206 if range_header else 200,
-            headers=headers
+            status=200,
+            headers={
+                "Content-Type": "video/mp4",
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-cache",
+            }
         )
         await response.prepare(request)
 
-        offset = int(math.floor(from_byte / chunk_size))
-        bytes_sent = 0
+        async with DEMUX_LOCK:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
 
-        async for chunk in bot.stream_media(msg, offset=offset):
-            if bytes_sent == 0 and (from_byte % chunk_size) != 0:
-                chunk = chunk[(from_byte % chunk_size):]
-
-            if bytes_sent + len(chunk) > content_length:
-                chunk = chunk[:content_length - bytes_sent]
-
-            await response.write(chunk)
-            await response.drain()
-            bytes_sent += len(chunk)
-
-            if bytes_sent >= content_length:
-                break
+            try:
+                while True:
+                    chunk = await process.stdout.read(64 * 1024)
+                    if not chunk:
+                        break
+                    await response.write(chunk)
+                    await response.drain()
+            except (asyncio.CancelledError, ConnectionResetError):
+                pass
+            finally:
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                        await process.wait()
+                    except Exception:
+                        pass
 
         return response
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# Metadata & Audio Stream Probe
+# Probes metadata to list all available audio tracks
 async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
         if msg_id in META_CACHE:
             return web.json_response(META_CACHE[msg_id], headers={"Access-Control-Allow-Origin": "*"})
 
-        source_url = f"http://127.0.0.1:{PORT}/watch/{msg_id}"
+        source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
         cmd = [
             "ffprobe",
             "-v", "error",
-            "-probesize", "5000000",
-            "-analyzeduration", "3000000",
+            "-probesize", "10000000",
+            "-analyzeduration", "5000000",
             "-show_entries", "stream=index,codec_type:stream_tags=language,title:format=duration",
             "-of", "json",
             source_url
@@ -172,6 +253,7 @@ async def handle_track_info(request):
     except Exception:
         return web.json_response({"duration": 0, "tracks": [{"id": 0, "title": "Default Audio"}]}, headers={"Access-Control-Allow-Origin": "*"})
 
+# Telegram Thumbnail Server
 async def handle_thumbnail(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -195,6 +277,7 @@ async def handle_thumbnail(request):
     fallback_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90" viewBox="0 0 160 90"><rect width="160" height="90" fill="#141414"/><text x="50%" y="50%" fill="#555" font-family="sans-serif" font-size="12" text-anchor="middle" dy=".3em">Episode</text></svg>'
     return web.Response(text=fallback_svg, content_type="image/svg+xml", headers={"Access-Control-Allow-Origin": "*"})
 
+# Bot Assistant
 @bot.on_message(filters.private & (filters.document | filters.video | filters.audio))
 async def bot_file_handler(client: Client, message: Message):
     try:
@@ -221,6 +304,7 @@ async def bot_file_handler(client: Client, message: Message):
     except Exception as e:
         await message.reply_text(f"⚠️ <b>Processing error:</b> <code>{str(e)}</code>", parse_mode=enums.ParseMode.HTML)
 
+# Internal Self-Ping
 async def keep_alive_worker():
     await asyncio.sleep(20)
     url = f"http://127.0.0.1:{PORT}/"
@@ -237,6 +321,7 @@ async def init_app():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     app.router.add_get("/watch/{msg_id}", handle_stream)
+    app.router.add_get("/raw/{msg_id}", handle_raw_stream)
     app.router.add_get("/thumb/{msg_id}", handle_thumbnail)
     app.router.add_get("/api/tracks/{msg_id}", handle_track_info)
     return app
