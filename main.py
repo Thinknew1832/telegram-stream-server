@@ -8,6 +8,7 @@ from aiohttp import web
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
+# Configurations
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -69,9 +70,8 @@ async def stream_telegram_media(msg: Message, request: web.Request):
         return web.Response(status=404, text="Media not found.")
 
     file_size = media.file_size
-    mime_type = media.mime_type or "video/mp4"
-
     range_header = request.headers.get("Range")
+
     if range_header:
         byte_range = range_header.replace("bytes=", "").split("-")
         from_byte = int(byte_range[0])
@@ -84,7 +84,7 @@ async def stream_telegram_media(msg: Message, request: web.Request):
     chunk_size = 1024 * 1024
 
     headers = {
-        "Content-Type": mime_type,
+        "Content-Type": "video/mp4",
         "Content-Range": f"bytes {from_byte}-{to_byte}/{file_size}",
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
@@ -139,58 +139,7 @@ async def handle_stream(request):
         file_name = (getattr(media, "file_name", "") or "").lower()
         mime_type = (media.mime_type or "").lower()
 
-        # Track 0 on native mp4 streams directly with full byte ranges
-        if track_id == "0" and mime_type == "video/mp4" and not file_name.endswith(".mkv"):
-            return await stream_telegram_media(msg, request)
-
-        source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
-
-        # Lightweight remux mapping the requested track without burning keyframes
-        cmd = [
-            "ffmpeg",
-            "-threads", "1",
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5",
-            "-i", source_url,
-            "-map", "0:v:0",
-            "-map", f"0:a:{track_id}?",
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-ac", "2",
-            "-movflags", "frag_keyframe+empty_moov+default_base_moof+faststart",
-            "-f", "mp4",
-            "pipe:1"
-        ]
-
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "video/mp4",
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "no-cache",
-            }
-        )
-        await response.prepare(request)
-
-        async with DEMUX_LOCK:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-         async def handle_stream(request):
-    try:
-        msg_id = int(request.match_info["msg_id"])
-        track_id = request.query.get("track", "0")
-
-        msg = await get_channel_message(msg_id)
-        media = msg.video or msg.document or msg.audio
-        if not media:
-            return web.Response(status=404, text="Media not found.")
-
-        file_name = (getattr(media, "file_name", "") or "").lower()
-        mime_type = (media.mime_type or "").lower()
-
-        # Track 0 single-audio MP4: direct fast Telegram range stream
+        # Track 0 single-audio MP4: direct Telegram byte-range streaming
         if track_id == "0" and mime_type == "video/mp4" and not file_name.endswith(".mkv"):
             return await stream_telegram_media(msg, request)
 
@@ -252,6 +201,7 @@ async def handle_stream(request):
         return response
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
+
 # Probes metadata to list all audio tracks
 async def handle_track_info(request):
     try:
