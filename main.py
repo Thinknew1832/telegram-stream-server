@@ -177,6 +177,57 @@ async def handle_stream(request):
         async with DEMUX_LOCK:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
+         async def handle_stream(request):
+    try:
+        msg_id = int(request.match_info["msg_id"])
+        track_id = request.query.get("track", "0")
+
+        msg = await get_channel_message(msg_id)
+        media = msg.video or msg.document or msg.audio
+        if not media:
+            return web.Response(status=404, text="Media not found.")
+
+        file_name = (getattr(media, "file_name", "") or "").lower()
+        mime_type = (media.mime_type or "").lower()
+
+        # Track 0 single-audio MP4: direct fast Telegram range stream
+        if track_id == "0" and mime_type == "video/mp4" and not file_name.endswith(".mkv"):
+            return await stream_telegram_media(msg, request)
+
+        source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
+
+        # Lightweight remuxing to MP4 container with chosen audio stream
+        cmd = [
+            "ffmpeg",
+            "-threads", "1",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-i", source_url,
+            "-map", "0:v:0",
+            "-map", f"0:a:{track_id}?",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-ac", "2",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4",
+            "pipe:1"
+        ]
+
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "video/mp4",
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-cache",
+            }
+        )
+        await response.prepare(request)
+
+        async with DEMUX_LOCK:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL
             )
@@ -201,7 +252,6 @@ async def handle_stream(request):
         return response
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
-
 # Probes metadata to list all audio tracks
 async def handle_track_info(request):
     try:
