@@ -63,7 +63,7 @@ async def get_channel_message(msg_id: int) -> Message:
         await bot.get_chat(BIN_CHANNEL)
         return await bot.get_messages(BIN_CHANNEL, msg_id)
 
-# Standard Range-Supported Telegram Stream
+# Full HTTP Range Request Handler for Telegram Media
 async def stream_telegram_media(msg: Message, request: web.Request):
     media = msg.video or msg.document or msg.audio
     if not media:
@@ -85,11 +85,12 @@ async def stream_telegram_media(msg: Message, request: web.Request):
 
     headers = {
         "Content-Type": "video/mp4",
-        "Content-Range": f"bytes {from_byte}-{to_byte}/{file_size}",
         "Accept-Ranges": "bytes",
+        "Content-Range": f"bytes {from_byte}-{to_byte}/{file_size}",
         "Content-Length": str(content_length),
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": "Range, Content-Type",
+        "Connection": "keep-alive",
     }
 
     if request.method == "HEAD":
@@ -101,19 +102,22 @@ async def stream_telegram_media(msg: Message, request: web.Request):
     offset = int(math.floor(from_byte / chunk_size))
     bytes_sent = 0
 
-    async for chunk in bot.stream_media(msg, offset=offset):
-        if bytes_sent == 0 and (from_byte % chunk_size) != 0:
-            chunk = chunk[(from_byte % chunk_size):]
+    try:
+        async for chunk in bot.stream_media(msg, offset=offset):
+            if bytes_sent == 0 and (from_byte % chunk_size) != 0:
+                chunk = chunk[(from_byte % chunk_size):]
 
-        if bytes_sent + len(chunk) > content_length:
-            chunk = chunk[:content_length - bytes_sent]
+            if bytes_sent + len(chunk) > content_length:
+                chunk = chunk[:content_length - bytes_sent]
 
-        await response.write(chunk)
-        await response.drain()
-        bytes_sent += len(chunk)
+            await response.write(chunk)
+            await response.drain()
+            bytes_sent += len(chunk)
 
-        if bytes_sent >= content_length:
-            break
+            if bytes_sent >= content_length:
+                break
+    except (asyncio.CancelledError, ConnectionResetError):
+        pass
 
     return response
 
@@ -125,11 +129,12 @@ async def handle_raw_stream(request):
     except Exception as e:
         return web.Response(status=500, text=str(e))
 
-# Stream Handler supporting Audio Track Selection
+# Stream Handler supporting Audio Track Selection, Fast-Seeking, and Pause Retention
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
         track_id = request.query.get("track", "0")
+        start_time = request.query.get("ss", "0")
 
         msg = await get_channel_message(msg_id)
         media = msg.video or msg.document or msg.audio
@@ -139,16 +144,18 @@ async def handle_stream(request):
         file_name = (getattr(media, "file_name", "") or "").lower()
         mime_type = (media.mime_type or "").lower()
 
-        # Track 0 single-audio MP4: direct Telegram byte-range streaming
-        if track_id == "0" and mime_type == "video/mp4" and not file_name.endswith(".mkv"):
+        # Track 0 on native single-audio MP4: direct Telegram byte-range streaming
+        if track_id == "0" and start_time == "0" and mime_type == "video/mp4" and not file_name.endswith(".mkv"):
             return await stream_telegram_media(msg, request)
 
         source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
 
-        # Lightweight remuxing to MP4 container with chosen audio stream
-        cmd = [
-            "ffmpeg",
-            "-threads", "1",
+        # Lightweight remuxing command
+        cmd = ["ffmpeg", "-threads", "1"]
+        if start_time != "0":
+            cmd += ["-ss", str(start_time)]
+
+        cmd += [
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "5",
@@ -170,6 +177,7 @@ async def handle_stream(request):
                 "Content-Type": "video/mp4",
                 "Access-Control-Allow-Origin": "*",
                 "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
             }
         )
         await response.prepare(request)
@@ -202,7 +210,7 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# Probes metadata to list all audio tracks
+# Probes metadata to list all audio tracks + exact duration
 async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
