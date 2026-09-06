@@ -51,7 +51,7 @@ LANG_MAP = {
 }
 
 META_CACHE = {}
-DEMUX_LOCK = asyncio.Semaphore(2)
+DEMUX_LOCK = asyncio.Semaphore(1)
 
 async def handle_ping(request):
     return web.Response(text="AnimeToon Stream Engine Online")
@@ -63,15 +63,16 @@ async def get_channel_message(msg_id: int) -> Message:
         await bot.get_chat(BIN_CHANNEL)
         return await bot.get_messages(BIN_CHANNEL, msg_id)
 
-# Telegram media byte streamer (Supports standard Range Requests)
+# Full HTTP Range Request Handler for Telegram Media
 async def stream_telegram_media(msg: Message, request: web.Request):
     media = msg.video or msg.document or msg.audio
     if not media:
         return web.Response(status=404, text="Media not found.")
 
     file_size = media.file_size
-    range_header = request.headers.get("Range")
+    mime_type = media.mime_type or "video/mp4"
 
+    range_header = request.headers.get("Range")
     if range_header:
         byte_range = range_header.replace("bytes=", "").split("-")
         from_byte = int(byte_range[0])
@@ -84,7 +85,7 @@ async def stream_telegram_media(msg: Message, request: web.Request):
     chunk_size = 1024 * 1024
 
     headers = {
-        "Content-Type": "video/mp4",
+        "Content-Type": mime_type,
         "Accept-Ranges": "bytes",
         "Content-Range": f"bytes {from_byte}-{to_byte}/{file_size}",
         "Content-Length": str(content_length),
@@ -117,7 +118,6 @@ async def stream_telegram_media(msg: Message, request: web.Request):
 
     return response
 
-# Internal endpoint consumed by FFmpeg and ffprobe
 async def handle_raw_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -126,7 +126,7 @@ async def handle_raw_stream(request):
     except Exception as e:
         return web.Response(status=500, text=str(e))
 
-# Primary stream route: Handles audio track extraction and fast-seeking
+# Stream Handler with Low-Resource Remuxing
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -138,29 +138,25 @@ async def handle_stream(request):
         if not media:
             return web.Response(status=404, text="Media not found.")
 
-        file_name = (getattr(media, "file_name", "") or "").lower()
-        mime_type = (media.mime_type or "").lower()
-
-        # If it's a native single-track MP4 and no track switch or seek is requested
-        if mime_type == "video/mp4" and not file_name.endswith(".mkv") and track_id == "0" and start_time == "0":
+        # If track is 0 and no seek offset requested, use direct byte-range streaming
+        if track_id == "0" and start_time == "0":
             return await stream_telegram_media(msg, request)
 
         source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
 
-        # FFmpeg remuxing: maps requested audio track and audio transcodes to browser AAC
-        cmd = ["ffmpeg"]
+        # Lightweight FFmpeg mapping with fast preset
+        cmd = ["ffmpeg", "-threads", "1"]
         if start_time != "0":
             cmd += ["-ss", str(start_time)]
         cmd += [
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5",
             "-i", source_url,
             "-map", "0:v:0",
             "-map", f"0:a:{track_id}?",
             "-c:v", "copy",
             "-c:a", "aac",
-            "-b:a", "192k",
+            "-b:a", "128k",
+            "-ac", "2",
+            "-preset", "ultrafast",
             "-movflags", "frag_keyframe+empty_moov+default_base_moof",
             "-f", "mp4",
             "pipe:1"
@@ -277,7 +273,7 @@ async def handle_thumbnail(request):
     fallback_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90" viewBox="0 0 160 90"><rect width="160" height="90" fill="#141414"/><text x="50%" y="50%" fill="#555" font-family="sans-serif" font-size="12" text-anchor="middle" dy=".3em">Episode</text></svg>'
     return web.Response(text=fallback_svg, content_type="image/svg+xml", headers={"Access-Control-Allow-Origin": "*"})
 
-# Bot Assistant
+# Telegram Bot File Assistant
 @bot.on_message(filters.private & (filters.document | filters.video | filters.audio))
 async def bot_file_handler(client: Client, message: Message):
     try:
@@ -304,7 +300,6 @@ async def bot_file_handler(client: Client, message: Message):
     except Exception as e:
         await message.reply_text(f"⚠️ <b>Processing error:</b> <code>{str(e)}</code>", parse_mode=enums.ParseMode.HTML)
 
-# Internal Self-Ping
 async def keep_alive_worker():
     await asyncio.sleep(20)
     url = f"http://127.0.0.1:{PORT}/"
@@ -334,9 +329,9 @@ if __name__ == "__main__":
 
         try:
             chat = await bot.get_chat(BIN_CHANNEL)
-            print(f"[INIT] Channel cached: {chat.title} ({chat.id})")
+            print(f"[INIT] Channel cached successfully: {chat.title} ({chat.id})")
         except Exception as e:
-            print(f"[INIT ERROR] {e}")
+            print(f"[INIT ERROR] Failed to cache channel: {e}")
 
         app = await init_app()
         runner = web.AppRunner(app)
