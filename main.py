@@ -63,7 +63,7 @@ async def get_channel_message(msg_id: int) -> Message:
         await bot.get_chat(BIN_CHANNEL)
         return await bot.get_messages(BIN_CHANNEL, msg_id)
 
-# Full HTTP Range Request Handler for Telegram Media
+# Telegram media stream with HTTP 206 Byte Ranges
 async def stream_telegram_media(msg: Message, request: web.Request):
     media = msg.video or msg.document or msg.audio
     if not media:
@@ -129,7 +129,7 @@ async def handle_raw_stream(request):
     except Exception as e:
         return web.Response(status=500, text=str(e))
 
-# Stream Handler supporting Audio Track Selection, Fast-Seeking, and Pause Retention
+# Multi-audio remuxer
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -144,13 +144,11 @@ async def handle_stream(request):
         file_name = (getattr(media, "file_name", "") or "").lower()
         mime_type = (media.mime_type or "").lower()
 
-        # Track 0 on native single-audio MP4: direct Telegram byte-range streaming
         if track_id == "0" and start_time == "0" and mime_type == "video/mp4" and not file_name.endswith(".mkv"):
             return await stream_telegram_media(msg, request)
 
         source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
 
-        # Lightweight remuxing command
         cmd = ["ffmpeg", "-threads", "1"]
         if start_time != "0":
             cmd += ["-ss", str(start_time)]
@@ -210,7 +208,7 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# Probes metadata to list all audio tracks + exact duration
+# Probes metadata to list audio tracks
 async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -284,33 +282,43 @@ async def handle_thumbnail(request):
     return web.Response(text=fallback_svg, content_type="image/svg+xml", headers={"Access-Control-Allow-Origin": "*"})
 
 # Telegram Bot File Assistant
-@bot.on_message(filters.private & (filters.document | filters.video | filters.audio))
+@bot.on_message(filters.private)
 async def bot_file_handler(client: Client, message: Message):
     try:
+        # Handle /start
+        if message.text and message.text.startswith("/start"):
+            await message.reply_text(
+                "👋 <b>AnimeToon Bot is Online!</b>\n\n"
+                "Forward or upload any video/MKV file here to get your stream link.",
+                parse_mode=enums.ParseMode.HTML
+            )
+            return
+
+        media = message.video or message.document or message.audio
+        if not media:
+            return
+
         try:
             await client.get_chat(BIN_CHANNEL)
         except Exception:
             pass
 
         forwarded = await message.forward(chat_id=BIN_CHANNEL)
-        name = "Unknown File"
-        if message.document and message.document.file_name:
-            name = message.document.file_name
-        elif message.video and message.video.file_name:
-            name = message.video.file_name
+        name = getattr(media, "file_name", None) or "Anime_Episode.mkv"
 
         reply_text = (
-            f"<b>File Processed Successfully!</b>\n\n"
+            f"🎬 <b>File Processed Successfully!</b>\n\n"
             f"<b>File Name:</b> <code>{name}</code>\n"
             f"<b>Message ID (msg_id):</b> <code>{forwarded.id}</code>\n"
             f"<b>Direct Stream:</b> <code>{FQDN}/watch/{forwarded.id}</code>\n\n"
-            f"<i>Put <code>{forwarded.id}</code> in Column K of your Google Sheet.</i>"
+            f"<i>Paste <code>{forwarded.id}</code> into Column K (msg_id) of your Google Sheet.</i>"
         )
         await message.reply_text(reply_text, parse_mode=enums.ParseMode.HTML)
     except Exception as e:
+        print(f"[BOT ERROR] {e}")
         await message.reply_text(f"⚠️ <b>Processing error:</b> <code>{str(e)}</code>", parse_mode=enums.ParseMode.HTML)
 
-# Internal Self-Ping
+# Internal Keep-Alive Ping
 async def keep_alive_worker():
     await asyncio.sleep(20)
     url = f"http://127.0.0.1:{PORT}/"
