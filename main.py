@@ -8,7 +8,6 @@ from aiohttp import web
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
-# Configurations
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -51,7 +50,7 @@ LANG_MAP = {
 }
 
 META_CACHE = {}
-DEMUX_LOCK = asyncio.Semaphore(1)
+DEMUX_LOCK = asyncio.Semaphore(2)
 
 async def handle_ping(request):
     return web.Response(text="AnimeToon Stream Engine Online")
@@ -63,7 +62,7 @@ async def get_channel_message(msg_id: int) -> Message:
         await bot.get_chat(BIN_CHANNEL)
         return await bot.get_messages(BIN_CHANNEL, msg_id)
 
-# Full HTTP Range Request Handler for Telegram Media
+# Standard Range-Supported Telegram Stream
 async def stream_telegram_media(msg: Message, request: web.Request):
     media = msg.video or msg.document or msg.audio
     if not media:
@@ -86,8 +85,8 @@ async def stream_telegram_media(msg: Message, request: web.Request):
 
     headers = {
         "Content-Type": mime_type,
-        "Accept-Ranges": "bytes",
         "Content-Range": f"bytes {from_byte}-{to_byte}/{file_size}",
+        "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": "Range, Content-Type",
@@ -126,29 +125,33 @@ async def handle_raw_stream(request):
     except Exception as e:
         return web.Response(status=500, text=str(e))
 
-# Stream Handler with Low-Resource Remuxing
+# Stream Handler supporting Audio Track Selection
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
         track_id = request.query.get("track", "0")
-        start_time = request.query.get("ss", "0")
 
         msg = await get_channel_message(msg_id)
         media = msg.video or msg.document or msg.audio
         if not media:
             return web.Response(status=404, text="Media not found.")
 
-        # If track is 0 and no seek offset requested, use direct byte-range streaming
-        if track_id == "0" and start_time == "0":
+        file_name = (getattr(media, "file_name", "") or "").lower()
+        mime_type = (media.mime_type or "").lower()
+
+        # Track 0 on native mp4 streams directly with full byte ranges
+        if track_id == "0" and mime_type == "video/mp4" and not file_name.endswith(".mkv"):
             return await stream_telegram_media(msg, request)
 
         source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
 
-        # Lightweight FFmpeg mapping with fast preset
-        cmd = ["ffmpeg", "-threads", "1"]
-        if start_time != "0":
-            cmd += ["-ss", str(start_time)]
-        cmd += [
+        # Lightweight remux mapping the requested track without burning keyframes
+        cmd = [
+            "ffmpeg",
+            "-threads", "1",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
             "-i", source_url,
             "-map", "0:v:0",
             "-map", f"0:a:{track_id}?",
@@ -156,8 +159,7 @@ async def handle_stream(request):
             "-c:a", "aac",
             "-b:a", "128k",
             "-ac", "2",
-            "-preset", "ultrafast",
-            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof+faststart",
             "-f", "mp4",
             "pipe:1"
         ]
@@ -200,7 +202,7 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# Probes metadata to list all available audio tracks
+# Probes metadata to list all audio tracks
 async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -300,6 +302,7 @@ async def bot_file_handler(client: Client, message: Message):
     except Exception as e:
         await message.reply_text(f"⚠️ <b>Processing error:</b> <code>{str(e)}</code>", parse_mode=enums.ParseMode.HTML)
 
+# Internal Self-Ping
 async def keep_alive_worker():
     await asyncio.sleep(20)
     url = f"http://127.0.0.1:{PORT}/"
@@ -329,9 +332,9 @@ if __name__ == "__main__":
 
         try:
             chat = await bot.get_chat(BIN_CHANNEL)
-            print(f"[INIT] Channel cached successfully: {chat.title} ({chat.id})")
+            print(f"[INIT] Channel cached: {chat.title} ({chat.id})")
         except Exception as e:
-            print(f"[INIT ERROR] Failed to cache channel: {e}")
+            print(f"[INIT ERROR] {e}")
 
         app = await init_app()
         runner = web.AppRunner(app)
