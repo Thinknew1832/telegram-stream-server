@@ -8,7 +8,6 @@ from aiohttp import web
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
-# Configurations
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -64,7 +63,6 @@ async def get_channel_message(msg_id: int) -> Message:
         await bot.get_chat(BIN_CHANNEL)
         return await bot.get_messages(BIN_CHANNEL, msg_id)
 
-# Standard Range-Supported Telegram Stream
 async def stream_telegram_media(msg: Message, request: web.Request):
     media = msg.video or msg.document or msg.audio
     if not media:
@@ -131,7 +129,6 @@ async def handle_raw_stream(request):
     except Exception as e:
         return web.Response(status=500, text=str(e))
 
-# High-Efficiency Stream Handler (Handles Seeking without Resetting + No Audio Lag)
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -146,13 +143,11 @@ async def handle_stream(request):
         file_name = (getattr(media, "file_name", "") or "").lower()
         mime_type = (media.mime_type or "").lower()
 
-        # Direct byte-range stream for native single-audio MP4 if not seeking via ss
         if track_id == "0" and start_time == "0" and mime_type == "video/mp4" and not file_name.endswith(".mkv"):
             return await stream_telegram_media(msg, request)
 
         source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
 
-        # Fast input seek + audio-resync to eliminate audio delay/lag
         cmd = ["ffmpeg", "-threads", "1"]
         try:
             ss_float = float(start_time)
@@ -161,6 +156,7 @@ async def handle_stream(request):
         except ValueError:
             pass
 
+        # Precise A/V synchronization flags
         cmd += [
             "-reconnect", "1",
             "-reconnect_streamed", "1",
@@ -172,7 +168,8 @@ async def handle_stream(request):
             "-c:a", "aac",
             "-b:a", "128k",
             "-ac", "2",
-            "-af", "aresample=async=1000",
+            "-af", "aresample=async=1:first_pts=0",
+            "-vsync", "1",
             "-movflags", "frag_keyframe+empty_moov+default_base_moof",
             "-f", "mp4",
             "pipe:1"
@@ -217,7 +214,6 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# Probes metadata to list audio tracks + total duration
 async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -280,7 +276,6 @@ async def handle_thumbnail(request):
         msg = await get_channel_message(msg_id)
         media = msg.video or msg.document
 
-        # 1. Try embedded Telegram thumbnail
         if media and hasattr(media, "thumbs") and media.thumbs:
             thumb = media.thumbs[0]
             file_bytes = await bot.download_media(thumb.file_id, in_memory=True)
@@ -292,11 +287,11 @@ async def handle_thumbnail(request):
                 headers={"Cache-Control": "public, max-age=604800", "Access-Control-Allow-Origin": "*"}
             )
 
-        # 2. Extract thumbnail via FFmpeg if Telegram has no embedded preview
+        # Fallback frame grab from the internal raw stream
         source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
         cmd = [
             "ffmpeg",
-            "-ss", "00:01:30",
+            "-ss", "00:00:45",
             "-i", source_url,
             "-vframes", "1",
             "-vf", "scale=320:-1",
@@ -323,7 +318,6 @@ async def handle_thumbnail(request):
     fallback_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90" viewBox="0 0 160 90"><rect width="160" height="90" fill="#181818"/><circle cx="80" cy="45" r="16" fill="#282828"/><polygon points="76,37 88,45 76,53" fill="#E50914"/></svg>'
     return web.Response(text=fallback_svg, content_type="image/svg+xml", headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=86400"})
 
-# Telegram Bot File Assistant
 @bot.on_message(filters.private)
 async def bot_file_handler(client: Client, message: Message):
     try:
@@ -358,7 +352,6 @@ async def bot_file_handler(client: Client, message: Message):
         print(f"[BOT ERROR] {e}")
         await message.reply_text(f"⚠️ <b>Processing error:</b> <code>{str(e)}</code>", parse_mode=enums.ParseMode.HTML)
 
-# Internal Self-Ping
 async def keep_alive_worker():
     await asyncio.sleep(20)
     url = f"http://127.0.0.1:{PORT}/"
