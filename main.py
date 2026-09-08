@@ -51,7 +51,8 @@ LANG_MAP = {
 }
 
 META_CACHE = {}
-DEMUX_LOCK = asyncio.Semaphore(2)
+THUMB_CACHE = {}
+DEMUX_LOCK = asyncio.Semaphore(3)
 
 async def handle_ping(request):
     return web.Response(text="AnimeToon Stream Engine Online")
@@ -63,7 +64,7 @@ async def get_channel_message(msg_id: int) -> Message:
         await bot.get_chat(BIN_CHANNEL)
         return await bot.get_messages(BIN_CHANNEL, msg_id)
 
-# Telegram media stream with HTTP 206 Byte Ranges
+# Standard Range-Supported Telegram Stream
 async def stream_telegram_media(msg: Message, request: web.Request):
     media = msg.video or msg.document or msg.audio
     if not media:
@@ -90,6 +91,7 @@ async def stream_telegram_media(msg: Message, request: web.Request):
         "Content-Length": str(content_length),
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": "Range, Content-Type",
+        "Cache-Control": "public, max-age=86400",
         "Connection": "keep-alive",
     }
 
@@ -129,7 +131,7 @@ async def handle_raw_stream(request):
     except Exception as e:
         return web.Response(status=500, text=str(e))
 
-# Multi-audio remuxer
+# High-Efficiency Stream Handler (Handles Seeking without Resetting + No Audio Lag)
 async def handle_stream(request):
     try:
         msg_id = int(request.match_info["msg_id"])
@@ -144,14 +146,20 @@ async def handle_stream(request):
         file_name = (getattr(media, "file_name", "") or "").lower()
         mime_type = (media.mime_type or "").lower()
 
+        # Direct byte-range stream for native single-audio MP4 if not seeking via ss
         if track_id == "0" and start_time == "0" and mime_type == "video/mp4" and not file_name.endswith(".mkv"):
             return await stream_telegram_media(msg, request)
 
         source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
 
+        # Fast input seek + audio-resync to eliminate audio delay/lag
         cmd = ["ffmpeg", "-threads", "1"]
-        if start_time != "0":
-            cmd += ["-ss", str(start_time)]
+        try:
+            ss_float = float(start_time)
+            if ss_float > 0:
+                cmd += ["-ss", str(ss_float)]
+        except ValueError:
+            pass
 
         cmd += [
             "-reconnect", "1",
@@ -164,6 +172,7 @@ async def handle_stream(request):
             "-c:a", "aac",
             "-b:a", "128k",
             "-ac", "2",
+            "-af", "aresample=async=1000",
             "-movflags", "frag_keyframe+empty_moov+default_base_moof",
             "-f", "mp4",
             "pipe:1"
@@ -208,12 +217,12 @@ async def handle_stream(request):
     except Exception as e:
         return web.Response(status=500, text=f"Streaming Error: {str(e)}")
 
-# Probes metadata to list audio tracks
+# Probes metadata to list audio tracks + total duration
 async def handle_track_info(request):
     try:
         msg_id = int(request.match_info["msg_id"])
         if msg_id in META_CACHE:
-            return web.json_response(META_CACHE[msg_id], headers={"Access-Control-Allow-Origin": "*"})
+            return web.json_response(META_CACHE[msg_id], headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=86400"})
 
         source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
         cmd = [
@@ -253,43 +262,74 @@ async def handle_track_info(request):
 
         res = {"duration": duration, "tracks": tracks}
         META_CACHE[msg_id] = res
-        return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
+        return web.json_response(res, headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=86400"})
     except Exception:
-        return web.json_response({"duration": 0, "tracks": [{"id": 0, "title": "Default Audio"}]}, headers={"Access-Control-Allow-Origin": "*"})
+        return web.json_response({"duration": 1440, "tracks": [{"id": 0, "title": "Default Audio"}]}, headers={"Access-Control-Allow-Origin": "*"})
 
-# Telegram Thumbnail Server
+# Episode Thumbnail Generator & Server
 async def handle_thumbnail(request):
     try:
         msg_id = int(request.match_info["msg_id"])
+        if msg_id in THUMB_CACHE:
+            return web.Response(
+                body=THUMB_CACHE[msg_id],
+                content_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=604800", "Access-Control-Allow-Origin": "*"}
+            )
+
         msg = await get_channel_message(msg_id)
         media = msg.video or msg.document
 
+        # 1. Try embedded Telegram thumbnail
         if media and hasattr(media, "thumbs") and media.thumbs:
             thumb = media.thumbs[0]
             file_bytes = await bot.download_media(thumb.file_id, in_memory=True)
+            body = file_bytes.getbuffer().tobytes()
+            THUMB_CACHE[msg_id] = body
             return web.Response(
-                body=file_bytes.getbuffer(),
+                body=body,
                 content_type="image/jpeg",
-                headers={
-                    "Cache-Control": "public, max-age=604800",
-                    "Access-Control-Allow-Origin": "*"
-                }
+                headers={"Cache-Control": "public, max-age=604800", "Access-Control-Allow-Origin": "*"}
+            )
+
+        # 2. Extract thumbnail via FFmpeg if Telegram has no embedded preview
+        source_url = f"http://127.0.0.1:{PORT}/raw/{msg_id}"
+        cmd = [
+            "ffmpeg",
+            "-ss", "00:01:30",
+            "-i", source_url,
+            "-vframes", "1",
+            "-vf", "scale=320:-1",
+            "-f", "image2",
+            "-q:v", "4",
+            "pipe:1"
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        stdout, _ = await process.communicate()
+        if stdout and len(stdout) > 500:
+            THUMB_CACHE[msg_id] = stdout
+            return web.Response(
+                body=stdout,
+                content_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=604800", "Access-Control-Allow-Origin": "*"}
             )
     except Exception:
         pass
 
-    fallback_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90" viewBox="0 0 160 90"><rect width="160" height="90" fill="#141414"/><text x="50%" y="50%" fill="#555" font-family="sans-serif" font-size="12" text-anchor="middle" dy=".3em">Episode</text></svg>'
-    return web.Response(text=fallback_svg, content_type="image/svg+xml", headers={"Access-Control-Allow-Origin": "*"})
+    fallback_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90" viewBox="0 0 160 90"><rect width="160" height="90" fill="#181818"/><circle cx="80" cy="45" r="16" fill="#282828"/><polygon points="76,37 88,45 76,53" fill="#E50914"/></svg>'
+    return web.Response(text=fallback_svg, content_type="image/svg+xml", headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=86400"})
 
 # Telegram Bot File Assistant
 @bot.on_message(filters.private)
 async def bot_file_handler(client: Client, message: Message):
     try:
-        # Handle /start
         if message.text and message.text.startswith("/start"):
             await message.reply_text(
-                "👋 <b>AnimeToon Bot is Online!</b>\n\n"
-                "Forward or upload any video/MKV file here to get your stream link.",
+                "👋 <b>AnimeToon Bot is Online!</b>\n\nForward or upload any video/MKV file here to get your stream link.",
                 parse_mode=enums.ParseMode.HTML
             )
             return
@@ -318,7 +358,7 @@ async def bot_file_handler(client: Client, message: Message):
         print(f"[BOT ERROR] {e}")
         await message.reply_text(f"⚠️ <b>Processing error:</b> <code>{str(e)}</code>", parse_mode=enums.ParseMode.HTML)
 
-# Internal Keep-Alive Ping
+# Internal Self-Ping
 async def keep_alive_worker():
     await asyncio.sleep(20)
     url = f"http://127.0.0.1:{PORT}/"
